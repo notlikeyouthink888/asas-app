@@ -1,0 +1,11 @@
+{
+  "name": "asas-app",
+  "private": true,
+  "description": "خادم مدير تطبيق «أساس»: مفاتيح API ونماذج للجميع، سجل التقارير، وتيليغرام",
+  "scripts": {
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

@@ -1,0 +1,11 @@
+# خادم «أساس» لمدير التطبيق.
+# أسهل نشر: زر «Deploy to Cloudflare» في README (ينشئ القاعدة ويربطها تلقائيًا ويسأل عن ADMIN_PASSWORD).
+# بسطر الأوامر: npx wrangler login ثم npx wrangler deploy ثم npx wrangler secret put ADMIN_PASSWORD
+name = "asas-app"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+# القاعدة تُنشأ وتُربط تلقائيًا عند النشر (لا حاجة لمعرّفها هنا)
+[[d1_databases]]
+binding = "DB"
+database_name = "asas-app-db"
