@@ -1,0 +1,22 @@
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+[Mm]emoryCaptures/
+.vs/
+.vscode/
+.idea/
+*.csproj
+*.sln
+*.user
+*.pidb
+*.booproj
+*.apk
+*.aab
+
+# مفتاح OpenRouter لا يُرفع أبدًا إلى GitHub (المستودع عام)
+Assets/Resources/OpenRouterKey.txt
+Assets/Resources/OpenRouterKey.txt.meta
