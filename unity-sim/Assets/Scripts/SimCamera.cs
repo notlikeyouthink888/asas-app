@@ -9,7 +9,7 @@ namespace AISim
     public class SimCamera : MonoBehaviour
     {
         public Vector3 pivot = Vector3.zero;
-        public float distance = 22f, yaw = 0f, pitch = 30f, size2D = 10f;
+        public float distance = 12f, yaw = 0f, pitch = 25f, size2D = 10f;
         public Transform follow;
         Camera cam;
 
@@ -20,11 +20,12 @@ namespace AISim
         public void ResetView()
         {
             pivot = DefaultPivot;
-            distance = 22f;
+            distance = 12f;
             yaw = 0f;
-            pitch = 30f;
+            pitch = 25f;
             size2D = 10f;
-            follow = null;
+            // في اللعبة تلحق الكاميرا الشخصية
+            follow = SimGame.Instance && SimGame.Instance.Player ? SimGame.Instance.Player.transform : null;
         }
 
         public void Drag(Vector2 delta)

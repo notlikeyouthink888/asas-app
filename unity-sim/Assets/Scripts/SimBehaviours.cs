@@ -7,6 +7,7 @@ namespace AISim
     {
         public string shape = "cube";
         public string colorName = "";
+        public string role = "";
         public Color color = Color.white;
     }
 

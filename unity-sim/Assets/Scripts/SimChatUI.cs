@@ -5,8 +5,8 @@ using UnityEngine;
 namespace AISim
 {
     /// <summary>
-    /// لوحة المحادثة: تكتب ما تريد، يرسله إلى OpenRouter مع وصف العالم، وينفذ الأوامر التي يردها.
-    /// مبنية بـ IMGUI حتى تعمل في أي مشروع بلا حزم إضافية.
+    /// لوحة المحادثة: تطلب تعديلًا على اللعبة، يرسله إلى OpenRouter مع وصف العالم، وينفذ الأوامر التي يردها
+    /// ويحفظها في المرحلة (SimLevel) حتى تبقى. مبنية بـ IMGUI حتى تعمل في أي مشروع بلا حزم إضافية.
     /// </summary>
     public class SimChatUI : MonoBehaviour
     {
@@ -21,12 +21,17 @@ namespace AISim
         const int HistoryLimit = 16;
         static readonly string[] Examples =
         {
-            "سويلي بيت بي باب وشباك وشجرتين يمه",
-            "طيّح 30 كرة ملونة من السما وخليهن ينطّن",
-            "سوي نظام شمسي والكواكب تدور حول الشمس",
-            "حولها 2D وسوي هرم من 15 مكعب وفجّره",
-            "خليها ليل وجاذبية القمر",
+            "ضيف 3 وحوش حمر يلاحقوني بس يكونون أبطأ مني",
+            "سوي قلعة بيها 3 مفاتيح ومهمة اجمع المفاتيح وبعدين روح للبوابة",
+            "ضيف شيخ يحجي وياي ويعطيني مهمة أقتل الوحوش",
+            "سوي بحيرة حمم وجسر فوكها وعملات على الجسر",
+            "حولها 2D مثل ماريو وسوي منصات أقفز عليها",
+            "خليها ليل وجاذبية القمر وخليني أقفز أعلى",
         };
+
+        public static float UiScale => Mathf.Max(1f, Mathf.Min(Screen.width, Screen.height) / 720f);
+        /// <summary>مكان لوحة المحادثة (بإحداثيات الواجهة بعد التكبير) حتى لا تغطيها أزرار اللعبة.</summary>
+        public static Rect Panel { get; private set; }
         static readonly string[] Presets = { "openai/gpt-4o-mini", "google/gemini-2.5-flash", "anthropic/claude-sonnet-4.5", "deepseek/deepseek-chat", OpenRouterClient.FallbackModel };
 
         readonly List<Msg> chat = new List<Msg>();
@@ -45,7 +50,7 @@ namespace AISim
             world = SimWorld.Instance;
             keyField = OpenRouterClient.ApiKey;
             modelField = OpenRouterClient.Model;
-            Add(false, "هلا! اكتبلي أي شي تريده يصير بالمحاكاة وآني أسويه. مثلًا: «سويلي سيارة حمرا وخليها تمشي».");
+            Add(false, "هلا بيك بلعبة المغامرات! العب بالأسهم وSpace وF وE، واكتبلي أي تعديل تريده على اللعبة (وحوش، مهمات، مراحل، شخصيات...) وآني أضيفه وينحفظ.");
             if (!OpenRouterClient.HasKey)
             {
                 settings = true;
@@ -114,7 +119,9 @@ namespace AISim
                 if (say != "") Add(false, say);
                 var log = new List<string>();
                 status = "ينفذ…";
-                yield return world.Run(d.Get("actions") as List<object>, log);
+                var actions = d.Get("actions") as List<object>;
+                yield return world.Run(actions, log);
+                SimLevel.Append(actions);
                 if (log.Count > 0) Add(false, string.Join("\n", log), true);
             }
             scroll.y = float.MaxValue;
@@ -171,12 +178,13 @@ namespace AISim
         void OnGUI()
         {
             Styles();
-            scale = Mathf.Max(1f, Mathf.Min(Screen.width, Screen.height) / 720f);
+            scale = UiScale;
             GUI.matrix = Matrix4x4.Scale(new Vector3(scale, scale, 1));
             float vw = Screen.width / scale, vh = Screen.height / scale;
             bool narrow = vw < 760;
             panel = narrow ? new Rect(0, vh * 0.45f, vw, vh * 0.55f) : new Rect(vw - 420, 0, 420, vh);
             if (hidden) panel = new Rect(vw - 1, 0, 0, 0);
+            Panel = panel;
 
             CameraInput();
             Toolbar();
@@ -197,9 +205,11 @@ namespace AISim
 
         void Toolbar()
         {
-            GUILayout.BeginArea(new Rect(8, 8, 330, 40));
+            GUILayout.BeginArea(new Rect(8, 8, 480, 40));
             GUILayout.BeginHorizontal();
             var cam = world ? world.Camera3D : null;
+            if (Button("إعادة اللعب", GUILayout.Width(90), GUILayout.Height(32))) Restart();
+            if (Button("تراجع", GUILayout.Width(60), GUILayout.Height(32))) Undo();
             if (GUILayout.Button("+", GUILayout.Width(40), GUILayout.Height(32)) && cam) cam.Zoom(-3);
             if (GUILayout.Button("−", GUILayout.Width(40), GUILayout.Height(32)) && cam) cam.Zoom(3);
             if (Button("كاميرا", GUILayout.Width(70), GUILayout.Height(32)) && cam) cam.ResetView();
@@ -213,8 +223,20 @@ namespace AISim
             var e = Event.current;
             var cam = world ? world.Camera3D : null;
             if (!cam) return;
-            bool overUi = panel.Contains(e.mousePosition) || new Rect(0, 0, 340, 50).Contains(e.mousePosition);
-            if (e.type == EventType.MouseDown && !overUi) dragging = true;
+            bool overUi = panel.Contains(e.mousePosition) || new Rect(0, 0, 490, 50).Contains(e.mousePosition)
+                || SimGame.ControlRects.Exists(r => r.Contains(e.mousePosition));
+            if (e.type == EventType.MouseDown && !overUi)
+            {
+                dragging = true;
+                GUI.FocusControl(null); // الضغط على المشهد يرجع التحكم للعب
+            }
+            // Enter خارج خانة الكتابة يفتحها للكتابة
+            if (e.type == EventType.KeyDown && (e.keyCode == KeyCode.Return || e.keyCode == KeyCode.KeypadEnter)
+                && GUI.GetNameOfFocusedControl() != "input" && !hidden && !settings)
+            {
+                GUI.FocusControl("input");
+                e.Use();
+            }
             if (e.rawType == EventType.MouseUp) dragging = false;
             if (e.type == EventType.MouseDrag && dragging) { cam.Drag(e.delta); e.Use(); }
             if (e.type == EventType.ScrollWheel && !overUi) { cam.Zoom(e.delta.y); e.Use(); }
@@ -257,12 +279,27 @@ namespace AISim
             if (Button("إرسال", GUILayout.Width(80), GUILayout.Height(34)) || enter)
             {
                 Send(input);
-                if (enter) e.Use();
+                // بعد الإرسال يرجع التحكم للعب، وEnter مرة ثانية يفتح الكتابة
+                if (enter) { e.Use(); GUI.FocusControl(null); }
             }
             GUI.enabled = true;
             GUI.SetNextControlName("input");
             input = GUILayout.TextField(input, 500, GUILayout.Height(34));
             GUILayout.EndHorizontal();
+        }
+
+        void Restart()
+        {
+            if (busy) return;
+            StartCoroutine(SimGame.Instance.Restart());
+        }
+
+        void Undo()
+        {
+            if (busy) return;
+            if (!SimLevel.Undo()) { Add(false, "ماكو تعديلات أتراجع عنها.", true); return; }
+            Add(false, $"تراجعت عن آخر تعديل. باقي {SimLevel.Batches.Count}.");
+            Restart();
         }
 
         void Settings(float w)
@@ -289,8 +326,24 @@ namespace AISim
                 RefreshBalance();
             }
             if (Button("تحديث الرصيد")) RefreshBalance();
-            if (Button("مسح المحادثة")) { chat.Clear(); history.Clear(); Add(false, "بدينا من جديد. شنو تريد أسوي؟"); }
-            if (Button("تصفير العالم")) world.ResetWorld();
+            if (Button("مسح المحادثة")) { chat.Clear(); history.Clear(); Add(false, "بدينا من جديد. شنو تريد أضيف للعبة؟"); }
+            GUILayout.Space(8);
+            Rtl($"المرحلة: {SimLevel.Batches.Count} تعديل محفوظ على هذا الجهاز.", small, w - 30);
+            if (Button("إعادة اللعب من البداية")) Restart();
+            if (Button("تراجع عن آخر تعديل")) Undo();
+            if (Button("رجّع المرحلة الافتراضية")) { SimLevel.ResetToDefault(); Restart(); }
+            if (Button("مرحلة فاضية (أبني من الصفر)")) { SimLevel.Empty(); Restart(); }
+            if (Button("نسخ المرحلة (JSON)"))
+            {
+                GUIUtility.systemCopyBuffer = SimLevel.Json;
+                Add(false, "انتسخت المرحلة. الصقها بملف Assets/Resources/DefaultLevel.json حتى تصير المرحلة الأساسية باللعبة.");
+            }
+            if (Button("لصق مرحلة من الحافظة"))
+            {
+                bool ok = SimLevel.SetFrom(GUIUtility.systemCopyBuffer);
+                if (ok) { SimLevel.Save(); Restart(); }
+                Add(false, ok ? "تم تحميل المرحلة." : "الحافظة ما بيها مرحلة صالحة.", !ok);
+            }
             GUILayout.EndScrollView();
         }
     }

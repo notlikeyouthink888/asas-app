@@ -77,6 +77,9 @@ namespace AISim
         }
 
         public SimCamera Camera3D => cam;
+        public Font Font => font;
+        // أثناء إعادة بناء المرحلة: بلا انتظار وبلا حركة تدريجية
+        bool instant;
 
         /* ── وصف العالم للنموذج ──────────────────────────── */
 
@@ -98,6 +101,9 @@ namespace AISim
                     ["scale"] = V(o.transform.localScale),
                 };
                 if (tag && tag.shape != "text") d["color"] = "#" + ColorUtility.ToHtmlStringRGB(tag.color);
+                if (tag && tag.role != "") d["role"] = tag.role;
+                if (o.TryGetComponent<Enemy>(out var en)) d["enemyHealth"] = en.health;
+                if (o.TryGetComponent<Npc>(out var npc)) d["title"] = npc.title;
                 var beh = o.GetComponents<SimBehaviour>().Select(b => (object)b.Kind).ToList();
                 if (beh.Count > 0) d["behaviors"] = beh;
                 if (o.TryGetComponent<Rigidbody>(out var rb) && !rb.isKinematic) d["physics"] = true;
@@ -109,6 +115,7 @@ namespace AISim
                 ["gravity"] = V(Physics.gravity),
                 ["timeScale"] = F(Time.timeScale),
                 ["objectCount"] = objects.Count,
+                ["game"] = SimGame.Instance ? SimGame.Instance.Describe() : null,
                 ["objects"] = list,
             };
             if (objects.Count > list.Count) state["note"] = $"only first {list.Count} objects listed";
@@ -117,30 +124,38 @@ namespace AISim
 
         /* ── تنفيذ الأوامر ───────────────────────────────── */
 
-        public IEnumerator Run(List<object> actions, List<string> log)
+        public IEnumerator Run(List<object> actions, List<string> log, bool instant = false)
         {
             if (actions == null) yield break;
+            this.instant = instant;
             foreach (var a in actions)
             {
                 if (!(a is Dictionary<string, object> act)) continue;
                 var type = (act.Str("type") ?? act.Str("action") ?? "").ToLowerInvariant();
                 if (type == "wait")
                 {
+                    if (instant) continue;
                     yield return new WaitForSecondsRealtime(Mathf.Clamp(act.Num("seconds", 1f), 0f, 10f));
                     continue;
                 }
                 try { Do(type, act, log); }
                 catch (Exception e) { log.Add($"{type}: {e.Message}"); Debug.LogException(e); }
             }
+            this.instant = false;
         }
 
         void Do(string type, Dictionary<string, object> a, List<string> log)
         {
+            var role = SimGame.RoleOf(type, a) ?? (type == "spawn" || type == "create" ? SimGame.RoleOf(a.Str("role") ?? "", a) : null);
+            if (role != null) { Spawn(SimGame.WithDefaults(role, a), log, role); return; }
             switch (type)
             {
                 case "spawn": case "create": Spawn(a, log); break;
                 case "delete": case "remove": case "destroy":
-                    foreach (var o in Targets(a)) { objects.Remove(o); Destroy(o); }
+                    foreach (var o in Targets(a)) { if (IsPlayer(o)) continue; objects.Remove(o); Destroy(o); }
+                    break;
+                case "player": case "quest": case "message": case "banner": case "score": case "heal":
+                    SimGame.Instance.Command(type, a, log);
                     break;
                 case "clear": Clear(); break;
                 case "reset": ResetWorld(); break;
@@ -165,11 +180,15 @@ namespace AISim
                     break;
                 }
                 case "behavior": case "behaviour": foreach (var o in Targets(a)) Behave(o, a); break;
-                case "physics": foreach (var o in Targets(a)) Physic(o, a); break;
+                case "physics": foreach (var o in Targets(a)) if (!IsPlayer(o)) Physic(o, a); break;
                 case "force": case "push": case "jump":
                 {
                     var f = a.Vec("force") ?? new Vector3(0, 6, 0);
-                    foreach (var o in Targets(a)) Body(o).AddForce(f, ForceMode.VelocityChange);
+                    foreach (var o in Targets(a))
+                    {
+                        if (o.TryGetComponent<SimPlayer>(out var pl)) pl.Knock(f);
+                        else Body(o).AddForce(f, ForceMode.VelocityChange);
+                    }
                     break;
                 }
                 case "explode": Explode(a); break;
@@ -208,7 +227,9 @@ namespace AISim
             ["plane"] = PrimitiveType.Plane, ["quad"] = PrimitiveType.Quad,
         };
 
-        void Spawn(Dictionary<string, object> a, List<string> log)
+        static bool IsPlayer(GameObject o) => o.TryGetComponent<SimPlayer>(out _);
+
+        void Spawn(Dictionary<string, object> a, List<string> log, string role = null)
         {
             var shapeName = (a.Str("shape") ?? "cube").ToLowerInvariant();
             if (!Shapes.TryGetValue(shapeName, out var prim)) { prim = PrimitiveType.Cube; shapeName = "cube"; }
@@ -242,6 +263,7 @@ namespace AISim
                 Paint(go, color);
                 if (a.Bool("physics") || a.Has("mass")) Physic(go, a);
                 if (a.Has("behavior") || a.Has("behaviour")) Behave(go, a);
+                if (role != null) SimGame.Instance.SetupRole(go, role, a);
                 objects.Add(go);
                 spawned.Add(go);
             }
@@ -318,6 +340,7 @@ namespace AISim
             if (low == "all" || low == "*" || low == "everything" || key == "الكل" || key == "كلشي")
                 return objects.Where(o => o).ToList();
             if (low == "last") return lastSpawned.Where(o => o).ToList();
+            if (low == "player" || key == "اللاعب") return SimGame.Instance && SimGame.Instance.Player ? new List<GameObject> { SimGame.Instance.Player.gameObject } : new List<GameObject>();
             var exact = objects.Where(o => o && string.Equals(o.name, key, StringComparison.OrdinalIgnoreCase)).ToList();
             if (exact.Count > 0) return exact;
             var prefix = objects.Where(o => o && o.name.StartsWith(key, StringComparison.OrdinalIgnoreCase)).ToList();
@@ -340,13 +363,14 @@ namespace AISim
             var target = a.Vec("position") ?? a.Vec("to");
             var by = a.Vec("by");
             var dest = target ?? o.transform.position + (by ?? Vector3.zero);
-            float dur = a.Num("duration", 0f);
+            float dur = instant ? 0f : a.Num("duration", 0f);
             if (dur > 0f) StartCoroutine(Glide(o.transform, dest, dur));
             else Teleport(o.transform, dest);
         }
 
         static void Teleport(Transform t, Vector3 p)
         {
+            if (t.TryGetComponent<SimPlayer>(out var player)) { player.Teleport(p); return; }
             t.position = p;
             if (t.TryGetComponent<Bounce>(out var b)) b.Rebase();
             if (t.TryGetComponent<Rigidbody>(out var rb) && !rb.isKinematic) rb.position = p;
@@ -472,6 +496,9 @@ namespace AISim
                 if (o.GetComponent<TextMesh>()) continue;
                 Body(o).AddExplosionForce(force, at, radius, 1f, ForceMode.VelocityChange);
             }
+            var player = SimGame.Instance ? SimGame.Instance.Player : null;
+            if (player && Vector3.Distance(player.transform.position, at) <= radius)
+                player.Knock((player.transform.position - at).normalized * force + Vector3.up * force * 0.3f);
         }
 
         void CameraCmd(Dictionary<string, object> a)
@@ -557,6 +584,7 @@ namespace AISim
             var c = Camera.main;
             if (c) c.clearFlags = CameraClearFlags.Skybox;
             cam.ResetView();
+            if (SimGame.Instance) SimGame.Instance.OnWorldReset();
         }
 
         /* ── الألوان (إنجليزي، عربي، #hex) ───────────────── */
