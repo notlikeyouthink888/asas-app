@@ -137,7 +137,8 @@ async function openRouter({ model, system, parts, maxTokens, signal, onText, onT
     model: model.id,
     messages: [{ role: 'system', content: system }, { role: 'user', content }],
     stream: true,
-    max_tokens: Math.min(maxTokens || 64000, model.maxOut || 64000),
+    // حد الإخراج المعروف للنموذج، وإن جُهل فـ 32 ألفًا (بعض المزودين يرفضون الأكبر)
+    max_tokens: Math.min(maxTokens || 64000, model.maxOut || 32000),
     usage: { include: true },
   };
   // بديل تلقائي إن تعطل النموذج المختار

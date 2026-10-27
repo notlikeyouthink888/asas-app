@@ -15,9 +15,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
 
@@ -25,17 +25,16 @@ jobs:
         working-directory: android/app/src/main/assets/www
         run: for f in js/*.js; do node --check --input-type=module < "$f" || exit 1; done
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
-
-      - uses: android-actions/setup-android@v3
 
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
 
+      # Android SDK موجود مسبقًا على خوادم GitHub (ANDROID_HOME)، وGradle ينزل ما ينقصه
       - name: Build APK
         working-directory: android
         run: gradle assembleRelease --no-daemon --stacktrace
