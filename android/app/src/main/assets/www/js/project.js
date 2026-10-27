@@ -3,7 +3,7 @@
 import { $, $$, esc, toast, ask, sheet, sleep, uid, money, tokens, ago, md, roadmapProgress, android } from './util.js';
 import { projects, settings, addVersion } from './store.js';
 import { modelFor } from './models.js';
-import { buildDoc, exportDoc, createGame, improveGame, autoDevelop, describeReport } from './engine.js';
+import { buildDoc, exportDoc, createGame, improveGame, autoDevelop, fixGame, describeReport } from './engine.js';
 import { go, pickModel, saveFile } from './app.js';
 
 let P = null;          // اللعبة المفتوحة
@@ -45,39 +45,67 @@ class Runner {
   onMsg(e) {
     const d = e.data;
     if (!d || !d.__gs || e.source !== this.frame.contentWindow) return;
-    if (d.type === 'error') { this.errors.push(d.error); if (!this.testing) showErrors(); }
+    if (d.type === 'error') { this.errors.push(d.error); if (!this.testing) { showErrors(); maybeAutoFix(); } }
     if (d.type === 'storage' && !this.testing && P) { P.storage = d.data; saveSoon(); }
     if (d.type === 'report' && this.pending?.id === d.id) this.pending.resolve(d.report);
   }
 
-  load(code, test) {
+  /**
+   * كل تشغيل بإطار جديد: نطلب من النسخة السابقة تحرير WebGL والصوت ثم نحذفها،
+   * لأن الهاتف يحد عدد السياقات الرسومية فيفشل إنشاء سياق جديد إن تراكمت.
+   */
+  async load(code, test) {
     this.errors = [];
     this.testing = test;
+    this.code = code;
     $('#stage .empty')?.remove();
-    const loaded = new Promise((r) => this.frame.addEventListener('load', r, { once: true }));
-    const storage = JSON.parse(JSON.stringify(P?.storage || {}));
-    this.frame.srcdoc = buildDoc(code, { test, storage });
-    return Promise.race([loaded, sleep(8000)]);
+    const old = this.frame;
+    try { old.contentWindow?.postMessage({ __gsCmd: 'release' }, '*'); } catch { /* الإطار حُذف */ }
+    await sleep(60);
+    const f = document.createElement('iframe');
+    f.id = 'game';
+    f.setAttribute('sandbox', 'allow-scripts allow-pointer-lock');
+    f.setAttribute('allow', 'autoplay; fullscreen; gamepad; accelerometer; gyroscope');
+    const loaded = new Promise((r) => f.addEventListener('load', r, { once: true }));
+    f.srcdoc = buildDoc(code, { test, storage: JSON.parse(JSON.stringify(P?.storage || {})) });
+    if (old.isConnected) old.replaceWith(f); else $('#stage')?.prepend(f);
+    this.frame = f;
+    await Promise.race([loaded, sleep(8000)]);
   }
 
   play(code) {
-    this.load(code, false);
-    showErrors();
+    // إن شُغّلت والتطبيق بالخلفية نعيد تشغيلها عند الرجوع (الرسم كان متوقفًا)
+    this.replay = document.hidden;
+    showErrors([]);
+    return this.load(code, false);
   }
 
   /** يشغّل اللعبة، يجرب لمسات وأزرارًا، ويرجع تقريرًا (مع لقطة شاشة إن طُلبت). */
   async test(code, { capture = false } = {}) {
-    await this.load(code, true);
-    await sleep(2200);
-    this.frame.contentWindow?.postMessage({ __gsCmd: 'poke' }, '*');
-    await sleep(2000);
-    const report = (await this.report()) || {
-      timeout: true, errors: this.errors, frames: 0, uptime: 0, canvases: [], text: '', buttons: 0, vw: 0, vh: 0, scrollW: 0, scrollH: 0,
-    };
-    if (capture) report.shot = await captureFrame(this.frame);
-    this.testing = false;
-    showErrors(report.errors);
-    return report;
+    // التطبيق بالخلفية: الصفحة لا ترسم ومؤقتاتها بطيئة، فنكتفي بفحص الصياغة (المحرك يضيفه)،
+    // والأخطاء الحقيقية يلتقطها الإصلاح التلقائي عند رجوعك للتطبيق
+    if (document.hidden) {
+      return { hidden: true, errors: [], frames: 0, uptime: 0, canvases: [], text: '', buttons: 0, vw: 0, vh: 0, scrollW: 0, scrollH: 0 };
+    }
+    let hidden = false;
+    const onVis = () => { if (document.hidden) hidden = true; };
+    document.addEventListener('visibilitychange', onVis);
+    try {
+      await this.load(code, true);
+      await sleep(2200);
+      this.frame.contentWindow?.postMessage({ __gsCmd: 'poke' }, '*');
+      await sleep(2000);
+      const report = (await this.report()) || {
+        timeout: true, errors: this.errors, frames: 0, uptime: 0, canvases: [], text: '', buttons: 0, vw: 0, vh: 0, scrollW: 0, scrollH: 0,
+      };
+      if (capture && !hidden && !document.hidden) report.shot = await captureFrame(this.frame);
+      report.hidden = hidden || document.hidden;
+      showErrors(report.errors);
+      return report;
+    } finally {
+      document.removeEventListener('visibilitychange', onVis);
+      this.testing = false;
+    }
   }
 
   report() {
@@ -97,10 +125,59 @@ function saveSoon() {
   saveTimer = setTimeout(() => { saveTimer = null; if (P) projects.put(P); }, 800);
 }
 
+/* ── إصلاح تلقائي للأخطاء أثناء اللعب ───────────────────── */
+
+let autoFixTimer = null;
+function maybeAutoFix() {
+  if (!settings.get('autofix', true) || op || !P?.code || !runner || document.hidden) return;
+  const v = P.versions?.at(-1);
+  if (!v || P.autoFixedVersion === v.n || runner.code !== P.code) return;
+  if (!runner.errors.some((e) => e.kind !== 'console' && e.kind !== 'resource')) return;
+  clearTimeout(autoFixTimer);
+  // ننتظر قليلًا حتى تتجمع الأخطاء المرتبطة
+  autoFixTimer = setTimeout(() => {
+    if (op || !P || !runner || P.autoFixedVersion === v.n || runner.code !== P.code) return;
+    P.autoFixedVersion = v.n;
+    const errs = runner.errors.slice(0, 8);
+    addChat('sys', `🔧 ظهر ${errs.length} خطأ أثناء التشغيل، أصلحه تلقائيًا…`);
+    runOp('fix', modelFor('build'), async (ctx) => {
+      const r = await fixGame(ctx, P, errs);
+      addChat('ai', r.summary || 'صلحت الأخطاء.');
+    });
+  }, 2500);
+}
+
+// الرجوع للتطبيق: إعادة تشغيل اللعبة إن شُغّلت وهو بالخلفية
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && runner?.replay && !op && P?.code) runner.play(P.code);
+});
+
+// رجع الإنترنت بعد أن أوقف انقطاعُه صنعَ لعبة: نكمل تلقائيًا
+let resumeOnline = false;
+addEventListener('online', () => {
+  if (resumeOnline && P && !P.code && !op) { resumeOnline = false; addChat('sys', '📶 رجع الإنترنت، أكمل صنع اللعبة…'); startCreate(); }
+});
+
+/** أول عملية: إذن الإشعارات، واستثناء توفير البطارية حتى يكمل الشغل بالخلفية. */
+async function askBackgroundOnce() {
+  if (!android?.backgroundAllowed) return;
+  if (!android.notificationsAllowed() && !settings.get('asked.notif')) {
+    settings.set('asked.notif', true);
+    android.requestNotifications();
+    return;
+  }
+  if (!android.backgroundAllowed() && !settings.get('asked.bg')) {
+    settings.set('asked.bg', true);
+    const yes = await ask('حتى يكمل التطبيق شغله وأنت طالع منه بدون ما ينقطع الاتصال، اسمح له يشتغل بالخلفية (استثناء من توفير البطارية).', { ok: 'اسمح', cancel: 'لاحقًا' });
+    if (yes) android.requestBackground();
+  }
+}
+
 /* ── الشاشة ────────────────────────────────────────────── */
 
 export async function projectScreen(app, id) {
   if (P?.id === id && runner && $('#game')) return;
+  clearTimeout(autoFixTimer);
   leaveProject();
   P = await projects.get(id);
   if (!P) { toast('اللعبة غير موجودة'); return go(''); }
@@ -139,6 +216,8 @@ export async function projectScreen(app, id) {
 
 export function leaveProject() {
   if (op) op.ac.abort();
+  clearTimeout(autoFixTimer);
+  resumeOnline = false;
   if (fullscreen) setFullscreen(false);
   runner?.destroy();
   runner = null;
@@ -185,15 +264,16 @@ function devTab() {
   const bm = modelFor('build'), am = modelFor('auto');
   $('#tab').innerHTML = `
     <div class="card busy" id="busy" hidden>
-      <div class="phase"><span class="spin"></span><span id="phase">…</span></div>
+      <div class="phase"><span class="spin"></span><span id="phase" class="grow">…</span><span class="muted" id="lines"></span></div>
       <div class="progress" id="prog" hidden><i></i></div>
       <div class="think" id="think"></div>
       <pre class="stream" id="stream"></pre>
       <div class="row"><span class="muted grow" id="cost"></span><button class="btn sm danger" id="stop">إيقاف</button></div>
       <div class="log" id="log"></div>
     </div>
-    ${!P.code && !op ? `<div class="card warn"><b>البناء لم يكتمل</b><p class="muted">صار انقطاع أثناء صنع اللعبة.</p>
-      <button class="btn primary" id="rebuild">أكمل صنع اللعبة</button></div>` : ''}
+    ${!P.code && !op ? `<div class="card warn"><b>صنع اللعبة توقف قبل ما يكمل</b>
+      <p class="muted">التقدم محفوظ: ${P.design ? '✅' : '⬜'} الخطة · ${P.draft?.code ? '✅' : '⬜'} الكود. اضغط «أكمل» ويكمل من حيث توقف، بدون ما يعيد الشي اللي خلص.</p>
+      <button class="btn primary" id="rebuild">▶ أكمل من حيث توقف</button></div>` : ''}
     <div class="chat" id="chat">${chatHtml()}</div>
     <div class="composer"><textarea id="req" rows="2" placeholder="اطلب أي تعديل: ضيف مرحلة، خلي البطل يطير، غيّر الألوان، صلّح شي…"></textarea>
       <button class="btn primary" id="send">إرسال</button></div>
@@ -201,7 +281,7 @@ function devTab() {
     <div class="card">
       <h3>🤖 التطوير التلقائي</h3>
       <p class="muted">النموذج يطوّر اللعبة وحده جولة بعد جولة: يشغّلها، يشوف لقطة الشاشة والأخطاء، يصلح، ويضيف ميزات من الخطة.
-        كل جولة تنحفظ كإصدار، وإذا انكسرت اللعبة يتراجع تلقائيًا. خلّي التطبيق مفتوح أثناء التطوير.</p>
+        كل جولة تنحفظ كإصدار، وإذا انكسرت اللعبة يتراجع تلقائيًا. تگدر تطلع من التطبيق والشغل يكمل (يظهر إشعار).</p>
       <div class="model"><span class="grow"><b>${esc(am?.name || '—')}</b><span class="muted">نموذج التطوير التلقائي</span></span><button class="btn sm" id="pa">تغيير</button></div>
       <label class="field">عدد الجولات: <b id="rv">${auto.rounds}</b><input type="range" id="rounds" min="1" max="20" value="${auto.rounds}"></label>
       <label class="field">أقصى صرف لهذه المرة (دولار)<input type="number" id="budget" min="0.1" step="0.5" value="${auto.budget}"></label>
@@ -231,12 +311,13 @@ function devTab() {
 
 /* ── تشغيل العمليات ────────────────────────────────────── */
 
-let streamBuf = '', thinkBuf = '', drawQueued = false;
+let streamBuf = '', thinkBuf = '', streamLines = 0, drawQueued = false;
 function draw() {
   drawQueued = false;
-  const s = $('#stream'), t = $('#think');
+  const s = $('#stream'), t = $('#think'), l = $('#lines');
   if (s) s.textContent = streamBuf.slice(-1400);
   if (t) t.textContent = thinkBuf ? '💭 ' + thinkBuf.slice(-220) : '';
+  if (l) l.textContent = streamLines ? `✍️ ${streamLines} سطر` : '';
 }
 function queueDraw() { if (!drawQueued) { drawQueued = true; requestAnimationFrame(draw); } }
 
@@ -248,8 +329,20 @@ function showBusy(on) {
 
 function uiCallbacks() {
   return {
-    phase: (t) => { const p = $('#phase'); if (p) p.textContent = t; streamBuf = ''; thinkBuf = ''; queueDraw(); },
-    text: (d) => { streamBuf += d; if (streamBuf.length > 4000) streamBuf = streamBuf.slice(-2000); queueDraw(); },
+    phase: (t) => {
+      const p = $('#phase');
+      if (p) p.textContent = t;
+      streamBuf = ''; thinkBuf = ''; streamLines = 0;
+      queueDraw();
+      android?.progress?.(`${P?.name || ''}: ${t}`);
+    },
+    text: (d) => {
+      streamBuf += d;
+      for (let i = d.indexOf('\n'); i >= 0; i = d.indexOf('\n', i + 1)) streamLines++;
+      if (streamBuf.length > 4000) streamBuf = streamBuf.slice(-2000);
+      queueDraw();
+    },
+    retry: (n, max) => { const l = $('#log'); if (l) l.insertAdjacentHTML('beforeend', `<div>📶 انقطع الاتصال، أنتظر وأعيد المحاولة (${n}/${max})…</div>`); },
     thinking: (d) => { thinkBuf += d; if (thinkBuf.length > 1000) thinkBuf = thinkBuf.slice(-400); queueDraw(); },
     spent: (now) => { const c = $('#cost'); if (c) c.textContent = `صُرف الآن ${money(now)} · كل اللعبة ${money(P?.spent)}`; },
     log: (t) => { const l = $('#log'); if (l) l.insertAdjacentHTML('beforeend', `<div>${esc(t)}</div>`); addChat('sys', t); },
@@ -264,7 +357,8 @@ async function runOp(kind, model, fn) {
   const ac = new AbortController();
   op = { ac, kind };
   const project = P;
-  android?.keepAwake(true);
+  android?.busy?.(true, `${P.name}: ${OP_TITLES[kind]}`);
+  askBackgroundOnce();
   // إعادة رسم التبويب تخفي ما لا يصلح أثناء العملية (مثل «البناء لم يكتمل») وتُظهر لوحة التقدم
   tab = 'dev';
   renderTab();
@@ -272,14 +366,25 @@ async function runOp(kind, model, fn) {
     model, runner, effort: settings.get('effort', 'high'), signal: ac.signal, spent: 0, ui: uiCallbacks(),
     budget: kind === 'auto' ? (+settings.get('auto', {}).budget || 1) : 0,
   };
+  let failure = null;
   try {
     await fn(ctx);
   } catch (e) {
     if (e.stop) addChat('sys', 'أوقفت العملية.');
-    else { addChat('err', e.message); console.error(e); }
+    else {
+      failure = e;
+      addChat('err', e.message + (kind === 'create' ? '\nالتقدم محفوظ — اضغط «أكمل» ويكمل من حيث توقف.' : ''));
+      console.error(e);
+      if (e.network && kind === 'create') resumeOnline = true;
+    }
   } finally {
     op = null;
-    android?.keepAwake(false);
+    android?.busy?.(false, '');
+    // إشعار بالنتيجة إن كان المستخدم خارج التطبيق
+    if (document.hidden && !ac.signal.aborted) {
+      android?.notifyDone?.(failure ? `⚠️ توقف العمل على «${project.name}»` : `✅ «${project.name}» جاهزة`,
+        failure ? `${failure.message} — التقدم محفوظ، ادخل واضغط «أكمل».` : `${OP_TITLES[kind]} خلص. ادخل وجرّبها!`);
+    }
     if (P === project) {
       await projects.put(P);
       if (P.code) runner?.play(P.code);
@@ -290,9 +395,11 @@ async function runOp(kind, model, fn) {
   }
 }
 
+const OP_TITLES = { create: 'صنع اللعبة', edit: 'تنفيذ طلبك', auto: 'التطوير التلقائي', fix: 'إصلاح الأخطاء' };
+
 function startCreate() {
   runOp('create', modelFor('build'), async (ctx) => {
-    addChat('sys', `🎨 ${ctx.model.name} يصمم اللعبة…`);
+    addChat('sys', P.design ? `▶ ${ctx.model.name} يكمل صنع اللعبة من حيث توقف…` : `🎨 ${ctx.model.name} يصمم اللعبة…`);
     P.status = 'building';
     const t = await createGame(ctx, P);
     addChat('ai', `${P.versions.at(-1)?.note || 'الإصدار الأول جاهز'}\n\nجرّبها فوق (⛶ العب)، واطلب أي تعديل، أو شغّل التطوير التلقائي.`);
@@ -362,18 +469,28 @@ function planTab(edit = false) {
   $('#tab').innerHTML = edit ? `
     <label class="field">تصميم اللعبة<textarea id="design" rows="12">${esc(P.design)}</textarea></label>
     <label class="field">خطة التطوير (- [ ] للمطلوب، - [x] للمنجز)<textarea id="roadmap" rows="10">${esc(P.roadmap)}</textarea></label>
+    <label class="field">تعليمات خاصة لهذه اللعبة (اختياري) — النموذج يلتزم بيها بكل طلب وتطوير
+      <textarea id="instr" rows="4" placeholder="مثلًا: لا تغيّر شكل البطل، خلي الألوان هادئة، كل النصوص بالعراقي">${esc(P.instructions || '')}</textarea></label>
     <div class="row end"><button class="btn ghost" id="cancel">إلغاء</button><button class="btn primary" id="save">حفظ</button></div>`
     : `<div class="card plan">
         <div class="row"><h3 class="grow">خطة التطوير</h3><span class="muted">${pr.total ? `${pr.done}/${pr.total} منجز` : ''}</span></div>
         ${pr.total ? `<div class="progress"><i style="width:${(pr.done / pr.total) * 100}%"></i></div>` : ''}
         ${md(P.roadmap) || '<p class="muted">ماكو خطة بعد.</p>'}</div>
       <div class="card plan"><h3>تصميم اللعبة</h3>${md(P.design) || '<p class="muted">ماكو تصميم بعد.</p>'}</div>
+      ${P.instructions ? `<div class="card"><h3>تعليماتك الخاصة لهذه اللعبة</h3><p>${esc(P.instructions)}</p></div>` : ''}
       ${P.description ? `<div class="card"><h3>وصفك الأصلي</h3><p>${esc(P.description)}</p></div>` : ''}
       <button class="btn" id="edit">✏️ عدّل الخطة بنفسك</button>
       <p class="muted">التطوير التلقائي يمشي على هذه الخطة بندًا بندًا، فأي شي تضيفه هنا راح يسويه.</p>`;
   if (edit) {
     $('#cancel').onclick = () => planTab();
-    $('#save').onclick = async () => { P.design = $('#design').value; P.roadmap = $('#roadmap').value; await projects.put(P); toast('انحفظت'); planTab(); };
+    $('#save').onclick = async () => {
+      P.design = $('#design').value;
+      P.roadmap = $('#roadmap').value;
+      P.instructions = $('#instr').value.trim();
+      await projects.put(P);
+      toast('انحفظت');
+      planTab();
+    };
   } else $('#edit').onclick = () => planTab(true);
 }
 

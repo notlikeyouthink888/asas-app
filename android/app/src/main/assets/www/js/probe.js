@@ -11,7 +11,9 @@
     if (typeof a === 'object') { try { return JSON.stringify(a).slice(0, 300); } catch (e) { return String(a); } }
     return String(a);
   }
+  var lost = false;
   function addErr(kind, msg, line, col, stack) {
+    if (lost) return;
     msg = String(msg || '').slice(0, 500);
     var key = kind + '|' + msg + '|' + (line || 0);
     for (var i = 0; i < errors.length; i++) { if (errors[i].key === key) { errors[i].count++; return; } }
@@ -61,12 +63,36 @@
   };
 
   var ctxType = new WeakMap();
+  var glContexts = [];
   var getCtx = HTMLCanvasElement.prototype.getContext;
   HTMLCanvasElement.prototype.getContext = function (type) {
     var c = getCtx.apply(this, arguments);
-    if (c && !ctxType.has(this)) ctxType.set(this, String(type));
+    var t = String(type);
+    var gl = t.indexOf('webgl') === 0 || t === 'experimental-webgl';
+    if (c && !ctxType.has(this)) {
+      ctxType.set(this, t);
+      if (gl) {
+        glContexts.push(c);
+        this.addEventListener('webglcontextlost', function () { addErr('webgl', 'WebGL context lost (the GPU context was taken away; the game must handle webglcontextlost/restored)'); }, false);
+      }
+    }
+    if (!c && gl) addErr('webgl', 'WebGL context could not be created (getContext("' + t + '") returned null)');
     return c;
   };
+  var audios = [];
+  ['AudioContext', 'webkitAudioContext'].forEach(function (name) {
+    var A = window[name];
+    if (!A) return;
+    var W = function () { var a = new (Function.prototype.bind.apply(A, [null].concat(Array.prototype.slice.call(arguments))))(); audios.push(a); return a; };
+    W.prototype = A.prototype;
+    try { window[name] = W; } catch (e) {}
+  });
+  function release() {
+    glContexts.forEach(function (c) { try { var x = c.getExtension('WEBGL_lose_context'); if (x) x.loseContext(); } catch (e) {} });
+    audios.forEach(function (a) { try { a.close(); } catch (e) {} });
+    glContexts = [];
+    audios = [];
+  }
   function blank(c) {
     if (ctxType.get(c) !== '2d' || !c.width || !c.height) return null;
     try {
@@ -145,6 +171,7 @@
     var d = ev.data || {};
     if (d.__gsCmd === 'report') send({ type: 'report', id: d.id, report: report() });
     if (d.__gsCmd === 'poke') poke();
+    if (d.__gsCmd === 'release') { lost = true; release(); }
   });
   document.addEventListener('DOMContentLoaded', function () { send({ type: 'ready' }); });
 })();

@@ -49,15 +49,35 @@ requestAnimationFrame(loop);
 </script></body></html>`;
 
 const calls = [];
+const count = {};
+const bump = (k) => (count[k] = (count[k] || 0) + 1);
+let failBuildOnce = true;   // أول طلب بناء يفشل برفض نهائي (400) لاختبار «أكمل من حيث توقف»
+let dropFirstPlan = true;   // أول طلب خطة ينقطع اتصاله لاختبار إعادة المحاولة التلقائية
+
+// لعبة تعمل لكن ترمي خطأ أثناء اللعب بعد نصف ثانية (لاختبار الإصلاح التلقائي أثناء اللعب)
+const GAME_LATE_BUG = `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body><canvas id="c"></canvas><script>
+const c = document.getElementById('c'), x = c.getContext('2d');
+c.width = innerWidth; c.height = innerHeight;
+let t = 0;
+function loop() { t++; x.fillStyle = '#063'; x.fillRect(0, 0, c.width, c.height); if (t > 30) spawnBoss(); requestAnimationFrame(loop); }
+requestAnimationFrame(loop);
+</script></body></html>`;
+
 function claudeReply(body) {
   const user = JSON.stringify(body.messages);
-  if (user.includes('Design a mobile game')) {
-    return `<name>نجمة الفضاء</name><design>## الفكرة\nكرة ذهبية تتحرك.\n- اللعب باللمس</design><roadmap>- [ ] حلقة اللعب\n- [ ] أعداء\n- [ ] نقاط</roadmap>`;
+  if (user.includes('WAS CUT OFF')) {
+    bump('continue');
+    // التكملة تبدأ بتكرار بسيط لآخر سطر (يجب أن يُحذف التكرار عند الوصل)
+    return GAME_V1.slice(GAME_V1.indexOf('let t = 0') - 20) + '\n</file>';
   }
-  if (user.includes('Build version 1')) {
-    return `<summary>بنيت الإصدار الأول.</summary><roadmap>- [x] حلقة اللعب\n- [ ] أعداء\n- [ ] نقاط</roadmap><file>\n${GAME_V1}\n</file>`;
+  if (user.includes('appeared while the owner was playing')) {
+    bump('playfix');
+    return `<summary>عرّفت الزعيم.</summary><edit>\n<<<<<<< SEARCH\nlet t = 0;\n=======\nlet t = 0; function spawnBoss() {}\n>>>>>>> REPLACE\n</edit>`;
   }
   if (user.includes('fails its automatic test')) {
+    const n = bump('fix');
+    // أول محاولة إصلاح ترجع تعديلًا لا ينطبق (ولا ينطبق بإعادة المحاولة): يجب ألا يضيع البناء
+    if (n <= 2) return `<summary>محاولة.</summary><edit>\n<<<<<<< SEARCH\nthis line does not exist\n=======\nnope\n>>>>>>> REPLACE\n</edit>`;
     return `<summary>صلحت دالة الأعداء.</summary><edit>\n<<<<<<< SEARCH\n  updateEnemies();\n=======\n  /* enemies later */\n>>>>>>> REPLACE\n</edit>`;
   }
   if (user.includes('did NOT apply')) {
@@ -67,6 +87,16 @@ function claudeReply(body) {
     // الأول بمسافات خاطئة عمدًا (المطابقة المرنة تنجح)، والثاني غير موجود (يُطلب تصحيحه مرة ثانية)
     return `<summary>أضفت النقاط.</summary><edit>\n<<<<<<< SEARCH\n      t++;\n=======\n  t++; localStorage.setItem('best', String(Math.max(best, t)));\n>>>>>>> REPLACE\n</edit><edit>\n<<<<<<< SEARCH\nlet t = 1;\n=======\nlet t = 0;\n>>>>>>> REPLACE\n</edit>`;
   }
+  if (user.includes('Build version 1')) {
+    bump('build');
+    // رد طويل انقطع عند حد الإخراج: نصف الملف فقط، والباقي يأتي بطلب «تكملة»
+    const cut = GAME_V1.indexOf('let t = 0');
+    return { text: `<summary>بنيت الإصدار الأول.</summary><roadmap>- [x] حلقة اللعب\n- [ ] أعداء\n- [ ] نقاط</roadmap><file>\n${GAME_V1.slice(0, cut + 5)}`, stop: 'max_tokens' };
+  }
+  if (user.includes('Design a mobile game')) {
+    bump('plan');
+    return `<name>نجمة الفضاء</name><design>## الفكرة\nكرة ذهبية تتحرك.\n- اللعب باللمس</design><roadmap>- [ ] حلقة اللعب\n- [ ] أعداء\n- [ ] نقاط</roadmap>`;
+  }
   return '<summary>لا شيء</summary>';
 }
 
@@ -74,7 +104,9 @@ function sse(events) {
   return events.map((e) => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join('');
 }
 
-function claudeStream(text) {
+function claudeStream(reply) {
+  const text = typeof reply === 'string' ? reply : reply.text;
+  const stop = typeof reply === 'string' ? 'end_turn' : reply.stop;
   const chunks = text.match(/[\s\S]{1,80}/g) || [''];
   return sse([
     { type: 'message_start', message: { id: 'msg_1', type: 'message', role: 'assistant', model: 'claude-opus-5-5', content: [], stop_reason: null, stop_sequence: null,
@@ -85,7 +117,7 @@ function claudeStream(text) {
     { type: 'content_block_start', index: 1, content_block: { type: 'text', text: '' } },
     ...chunks.map((c) => ({ type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: c } })),
     { type: 'content_block_stop', index: 1 },
-    { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 3000 } },
+    { type: 'message_delta', delta: { stop_reason: stop, stop_sequence: null }, usage: { output_tokens: 3000 } },
     { type: 'message_stop' },
   ]);
 }
@@ -125,6 +157,12 @@ await page.route('https://api.anthropic.com/**', async (route) => {
   if (req.method() === 'GET') return route.fulfill({ json: { data: [{ id: 'claude-opus-5-5' }, { id: 'claude-sonnet-5-5' }], has_more: false, first_id: 'a', last_id: 'b' } });
   const body = req.postDataJSON();
   calls.push({ provider: 'anthropic', headers: req.headers(), body });
+  const user = JSON.stringify(body.messages);
+  if (dropFirstPlan && user.includes('Design a mobile game')) { dropFirstPlan = false; return route.abort('internetdisconnected'); }
+  if (failBuildOnce && user.includes('Build version 1') && !user.includes('WAS CUT OFF')) {
+    failBuildOnce = false;
+    return route.fulfill({ status: 400, json: { type: 'error', error: { type: 'invalid_request_error', message: 'mock: prompt rejected once' } } });
+  }
   await route.fulfill({ status: 200, headers: { 'content-type': 'text/event-stream' }, body: claudeStream(claudeReply(body)) });
 });
 await page.route('https://openrouter.ai/**', async (route) => {
@@ -172,22 +210,43 @@ await page.waitForSelector('.sheet .opt');
 await page.screenshot({ path: join(OUT, '3-models.png') });
 await page.click('.sheet .opt[data-id="qwen/qwen3-coder-plus"]');
 
-// لعبة جديدة
+// تعليمات إضافية للنموذج (البرومبت اختياري وقابل للتعديل)
+await page.click('[data-seg="pmode"] [data-v="extra"]');
+await page.fill('#pextra', 'EXTRA-RULE-123: كل النصوص بالعراقي');
+await page.screenshot({ path: join(OUT, '2b-prompt.png'), fullPage: true });
+
+// لعبة جديدة بلا وصف («فاجئني»)
 await page.click('#back');
 await page.click('#new');
-await page.fill('#desc', 'لعبة كرة ذهبية تتحرك وتتجنب الأعداء وتجمع نقاط');
+check((await page.textContent('#make')).includes('فاجئني'), 'زر «فاجئني» يظهر حين يكون الوصف فارغًا');
 await page.click('[data-seg="orientation"] [data-v="landscape"]');
+await page.click('[data-seg="dim"] [data-v="3D"]');
 await page.screenshot({ path: join(OUT, '4-new.png'), fullPage: true });
 await page.click('#make');
 await page.waitForSelector('#busy:not([hidden])');
+// أول خطة ينقطع اتصالها ثم تُعاد تلقائيًا؛ أول بناء يُرفض فيتوقف مع حفظ الخطة
+await page.waitForFunction(() => document.querySelector('#rebuild'), null, { timeout: 60000 });
+check(count.plan === 1 && calls.filter((c) => JSON.stringify(c.body.messages).includes('Design a mobile game')).length === 2,
+  'انقطاع الاتصال: طلب الخطة أُعيد تلقائيًا ونجح');
+const cardText = await page.textContent('.card.warn');
+check(cardText.includes('✅ الخطة') && cardText.includes('⬜ الكود'), 'بعد الفشل: الخطة محفوظة والبطاقة تعرض «أكمل من حيث توقف»');
+await page.screenshot({ path: join(OUT, '5-resume.png') });
+await page.click('#rebuild');
+await page.waitForSelector('#busy:not([hidden])');
 await page.waitForTimeout(800);
-await page.screenshot({ path: join(OUT, '5-building.png') });
-await page.waitForFunction(() => document.querySelector('#busy')?.hidden && document.querySelector('#chat')?.textContent.includes('جرّبها'), null, { timeout: 90000 });
+await page.screenshot({ path: join(OUT, '5b-building.png') });
+await page.waitForFunction(() => document.querySelector('#busy')?.hidden && document.querySelector('#chat')?.textContent.includes('جرّبها'), null, { timeout: 120000 });
 await page.screenshot({ path: join(OUT, '6-built.png') });
+check(count.plan === 1, '«أكمل» لم يعد كتابة الخطة (كمل من البناء)');
+check(count.continue === 1, 'الرد الطويل المقطوع اكتمل بطلب «تكملة» بدل البدء من جديد');
 
 let state = await readProject();
 check(state.name === 'نجمة الفضاء', 'اسم اللعبة من الخطة');
-check(state.versions.length === 1 && !state.code.includes('updateEnemies();') && state.code.includes('enemies later'), 'الإصدار الأول بعد إصلاح الخطأ تلقائيًا');
+check(state.versions.length === 1 && !state.code.includes('updateEnemies();') && state.code.includes('enemies later'),
+  'محاولة إصلاح فاشلة لم تضيّع البناء: المحاولة التالية صلحت الخطأ وانحفظ الإصدار الأول');
+check(state.code.split('let t = 0').length === 2 && state.code.includes('requestAnimationFrame(loop);') && !state.draft,
+  'وصل التكملة بدون تكرار والملف كامل');
+check(!state.description && state.chat[0].text.includes('فاجئني'), 'اللعبة انصنعت بدون وصف');
 check(state.roadmap.includes('- [x] حلقة اللعب'), 'الخطة محدثة');
 check(state.spent > 0, 'حساب التكلفة: ' + state.spent.toFixed(4));
 
@@ -195,8 +254,15 @@ const first = calls.find((c) => c.provider === 'anthropic');
 check(first.headers['x-api-key'] === 'sk-ant-test-key', 'مفتاح كلود يُرسل');
 check(first.headers['anthropic-dangerous-direct-browser-access'] === 'true', 'رأس الاتصال من التطبيق');
 check((first.headers['anthropic-beta'] || '').includes('server-side-fallback-2026-07-01') && first.body.fallbacks === 'default', 'البديل التلقائي عند الرفض');
-check(first.body.model === 'claude-opus-5-5' && first.body.thinking?.type === 'adaptive' && first.body.output_config?.effort === 'high', 'Opus 5.5 + تفكير تكيفي + عمق عالي');
+const buildCall = calls.find((c) => JSON.stringify(c.body.messages).includes('Build version 1'));
+check(first.body.model === 'claude-opus-5-5' && first.body.thinking?.type === 'adaptive' && first.body.output_config?.effort === 'medium'
+  && buildCall.body.output_config?.effort === 'high', 'Opus 5.5 + تفكير تكيفي: الخطة بعمق متوسط (أسرع) والبناء بعمق عالي');
 check(first.body.system[0].cache_control?.type === 'ephemeral', 'التعليمات محفوظة مؤقتًا (caching)');
+const sys = first.body.system[0].text;
+check(sys.includes('EXTRA-RULE-123') && sys.includes('RESPONSE FORMAT') && sys.includes("THE OWNER'S PHONE") && sys.includes('WebGL'),
+  'البرومبت: الجاهز + إضافاتك + صيغة الرد + مواصفات الهاتف');
+check(JSON.stringify(first.body.messages).includes('left the description empty') && JSON.stringify(first.body.messages).includes('dimension=3D'),
+  'بلا وصف: النموذج يخترع لعبة حسب الاختيارات (3D)');
 const fixCall = calls.find((c) => JSON.stringify(c.body.messages).includes('fails its automatic test'));
 const fixText = JSON.stringify(fixCall.body.messages);
 check(fixText.includes('updateEnemies is not defined') && fixText.includes('updateEnemies();'), 'تقرير الخطأ مع مقطع الكود يصل للنموذج');
@@ -233,6 +299,25 @@ check(orCalls.length >= 2 && orCalls[0].body.models?.includes('openrouter/auto')
 check(state.code.includes("'#315'") && state.versions.length >= 3, 'جولة التطوير التلقائي حفظت إصدارًا جديدًا');
 check(state.storage && state.storage.best, 'حفظ اللعبة (localStorage) يصل للتطبيق: best=' + state.storage?.best);
 
+// خطأ يظهر أثناء اللعب ← إصلاح تلقائي
+await page.click('#back');
+await page.waitForSelector('#imp', { state: 'attached' });
+await page.setInputFiles('#imp', { name: 'boss.html', mimeType: 'text/html', buffer: Buffer.from(GAME_LATE_BUG) });
+await page.waitForFunction(() => document.querySelector('#chat')?.textContent.includes('أصلحه تلقائيًا'), null, { timeout: 30000 });
+await page.waitForFunction(() => document.querySelector('#busy')?.hidden && document.querySelector('#chat')?.textContent.includes('عرّفت الزعيم'), null, { timeout: 60000 });
+const fixed = (await page.evaluate(async () => {
+  const db = await new Promise((r) => { const q = indexedDB.open('gamestudio'); q.onsuccess = () => r(q.result); });
+  return new Promise((r) => { const q = db.transaction('projects').objectStore('projects').getAll(); q.onsuccess = () => r(q.result); });
+})).find((p) => p.name === 'boss');
+check(count.playfix === 1 && fixed.versions.length === 2 && fixed.code.includes('function spawnBoss') && fixed.versions[1].note.startsWith('🔧'),
+  'خطأ ظهر أثناء اللعب انصلح تلقائيًا وانحفظ كإصدار جديد');
+await page.waitForTimeout(2500);
+check(await page.isHidden('#errs'), 'بعد الإصلاح التلقائي اللعبة تعمل بلا أخطاء');
+check(count.playfix === 1, 'الإصلاح التلقائي ما يتكرر بحلقة');
+await page.click('#back');
+await page.click('.game:has-text("نجمة الفضاء")');
+await page.waitForSelector('#game');
+
 // الخطة والإصدارات
 await page.click('[data-tab="plan"]');
 await page.screenshot({ path: join(OUT, '8-plan.png'), fullPage: true });
@@ -243,7 +328,7 @@ await page.waitForTimeout(500);
 await page.screenshot({ path: join(OUT, '10-play.png') });
 
 // خطأ updateEnemies مقصود في الإصدار الأول الوهمي (من داخل اللعبة لا الواجهة)
-const pageErrors = logs.filter((l) => l.startsWith('[pageerror]') && !l.includes('updateEnemies'));
+const pageErrors = logs.filter((l) => l.startsWith('[pageerror]') && !/updateEnemies|spawnBoss/.test(l));
 check(!pageErrors.length, 'لا أخطاء في واجهة التطبيق' + (pageErrors.length ? ': ' + pageErrors.join(' | ') : ''));
 if (failures) console.log(logs.slice(-30).join('\n'));
 await browser.close();

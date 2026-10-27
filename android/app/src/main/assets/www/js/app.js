@@ -1,12 +1,12 @@
 // الواجهة: الرئيسية، لعبة جديدة، الإعدادات، واختيار النماذج. شاشة اللعبة في project.js.
 
-import { $, $$, esc, toast, ask, sheet, modalStack, money, ago, uid, android } from './util.js';
+import { $, $$, esc, toast, ask, sheet, modalStack, money, ago, uid, android, deviceInfo } from './util.js';
 import { projects, settings, keys, addVersion } from './store.js';
 import {
   CLAUDE_MODELS, TIERS, openRouterModels, openRouterUpdatedAt, refreshOpenRouter, modelFor, setModelFor,
 } from './models.js';
 import { claudeModels, openRouterBalance } from './llm.js';
-import { loadProbe } from './engine.js';
+import { loadProbe, DEFAULT_RULES } from './engine.js';
 import { projectScreen, leaveProject, projectBack } from './project.js';
 
 const app = $('#app');
@@ -116,7 +116,7 @@ function newGame() {
   app.innerHTML = `
     <header class="top"><button class="icon" id="back">→</button><h1>لعبة جديدة</h1></header>
     <main class="page">
-      <label class="field">اوصف اللعبة بالتفصيل: فكرتها، البطل، الأعداء، المراحل، الشكل، أي شي تتخيله
+      <label class="field">وصف اللعبة (اختياري): فكرتها، البطل، الأعداء، المراحل، الشكل… إذا تتركه فاضي، الذكاء الاصطناعي يخترع لعبة تناسب اختياراتك
         <textarea id="desc" rows="7" placeholder="مثلًا: لعبة نينجا يركض على السطوح ويقفز فوق الفجوات، يرمي نجوم على الأعداء، كل مرحلة بمدينة مختلفة...">${esc(draft.desc || '')}</textarea>
       </label>
       <div class="chips">${EXAMPLES.map((e, i) => `<button class="chip" data-ex="${i}">${esc(e.split(':')[0])}</button>`).join('')}</div>
@@ -126,29 +126,37 @@ function newGame() {
         <label class="field">الشكل ${seg('style', [['auto', 'تلقائي'], ['cartoon', 'كرتوني'], ['pixel', 'بكسل'], ['neon', 'نيون'], ['realistic', 'واقعي']], draft.style || 'auto')}</label>
         <label class="field">لغة نصوص اللعبة ${seg('lang', [['Arabic', 'عربي'], ['English', 'English']], draft.lang || 'Arabic')}</label>
       </div>
+      <details class="card" ${draft.instr ? 'open' : ''}><summary>📜 تعليمات خاصة لهذه اللعبة (اختياري)</summary>
+        <textarea id="instr" rows="3" placeholder="مثلًا: كل النصوص بالعراقي، لا تستخدم دم، خلي التحكم بإصبع واحد">${esc(draft.instr || '')}</textarea></details>
       <div class="model">${m ? `<span class="grow"><b>${esc(m.name)}</b><span class="muted">النموذج اللي راح يصمم ويبني</span></span>` : '<span class="grow muted">لا يوجد مفتاح بعد</span>'}
         <button class="btn sm" id="pick">تغيير</button></div>
-      <button class="btn primary big" id="make">🚀 اصنع اللعبة</button>
-      <p class="muted">النموذج يكتب خطة اللعبة أولًا، ثم يبني الإصدار الأول، يختبره، ويصلح أخطاءه تلقائيًا. بعدها تكدر تطورها بالطلبات أو تلقائيًا.</p>
+      <button class="btn primary big" id="make"></button>
+      <p class="muted">النموذج يكتب خطة اللعبة أولًا، ثم يبني الإصدار الأول، يختبره، ويصلح أخطاءه تلقائيًا. تگدر تطلع من التطبيق والشغل يكمل،
+        وإذا انقطع النت يكمل من حيث توقف. بعدها تطورها بالطلبات أو تلقائيًا.</p>
     </main>`;
   bindSegs(app);
-  const save = () => settings.set('draft', {
-    desc: $('#desc').value, dim: readSeg(app, 'dim'), orientation: readSeg(app, 'orientation'), style: readSeg(app, 'style'), lang: readSeg(app, 'lang'),
-  });
+  const label = () => { $('#make').textContent = $('#desc').value.trim() ? '🚀 اصنع اللعبة' : '🎲 فاجئني بلعبة (بدون وصف)'; };
+  const save = () => {
+    label();
+    settings.set('draft', {
+      desc: $('#desc').value, instr: $('#instr').value, dim: readSeg(app, 'dim'), orientation: readSeg(app, 'orientation'), style: readSeg(app, 'style'), lang: readSeg(app, 'lang'),
+    });
+  };
+  label();
   $('#desc').oninput = save;
+  $('#instr').oninput = save;
   $$('.seg', app).forEach((s) => s.addEventListener('change', save));
   $$('[data-ex]').forEach((b) => (b.onclick = () => { $('#desc').value = EXAMPLES[b.dataset.ex]; save(); }));
   $('#back').onclick = () => history.back();
   $('#pick').onclick = () => pickModel('build', () => newGame());
   $('#make').onclick = async () => {
     const desc = $('#desc').value.trim();
-    if (desc.length < 10) return toast('اكتب وصفًا أطول للعبة');
     if (!modelFor('build')) { toast('أضف مفتاحًا أولًا'); return go('settings'); }
     save();
     const p = {
-      id: uid(), name: 'لعبة جديدة', description: desc, design: '', roadmap: '', status: 'building', createdAt: Date.now(),
+      id: uid(), name: 'لعبة جديدة', description: desc, instructions: $('#instr').value.trim(), design: '', roadmap: '', status: 'building', createdAt: Date.now(),
       options: { dim: readSeg(app, 'dim'), orientation: readSeg(app, 'orientation'), style: readSeg(app, 'style'), lang: readSeg(app, 'lang') },
-      chat: [{ role: 'user', text: desc, at: Date.now() }], versions: [], code: '',
+      chat: [{ role: 'user', text: desc || '🎲 فاجئني بلعبة من اختيارك', at: Date.now() }], versions: [], code: '',
     };
     await projects.put(p);
     settings.set('draft', null);
@@ -235,6 +243,19 @@ function settingsScreen() {
         <div class="row"><button class="btn sm" id="refresh">🔄 تحديث قائمة OpenRouter</button>
           <span class="muted" id="refst">${openRouterUpdatedAt() ? 'آخر تحديث ' + ago(openRouterUpdatedAt()) : 'لم تُحدَّث بعد'}</span></div>
       </div>
+      <div class="card"><h3>📜 تعليمات النموذج (البرومبت)</h3>
+        <p class="muted">انت تختار: تعليماتنا الجاهزة لصنع الألعاب، أو تضيف عليها، أو تكتب تعليماتك انت بالكامل. صيغة الرد تنضاف دائمًا لأن التطبيق يحتاجها حتى يقرأ الكود.</p>
+        ${seg('pmode', [['default', 'الجاهزة'], ['extra', 'الجاهزة + إضافاتي'], ['custom', 'تعليماتي فقط']], settings.get('prompt.mode', 'default'))}
+        <textarea id="pextra" rows="4" placeholder="إضافاتك: مثلًا كل الألعاب بأسلوب كرتوني، الأصوات هادئة، النصوص بالعراقي…">${esc(settings.get('prompt.extra') || '')}</textarea>
+        <textarea id="pcustom" class="ltr" rows="10" placeholder="اكتب تعليماتك الكاملة للنموذج…">${esc(settings.get('prompt.custom') || '')}</textarea>
+        <div class="row"><button class="btn sm" id="pcopy">انسخ الجاهزة هنا حتى أعدلها</button><button class="btn sm" id="pview">عرض الجاهزة</button></div>
+      </div>
+      <div class="card"><h3>📶 الشغل بالخلفية</h3>
+        <p class="muted">صنع اللعبة والتطوير التلقائي يكملون وانت طالع من التطبيق (يظهر إشعار بالتقدم، وإشعار ثاني لما يخلص).
+          حتى ما يوقفه نظام توفير البطارية، اسمح للتطبيق يشتغل بالخلفية.</p>
+        <div class="row"><span class="grow" id="bgst"></span><button class="btn sm" id="bg">اسمح بالخلفية</button></div>
+        <label class="row"><input type="checkbox" id="autofix" ${settings.get('autofix', true) ? 'checked' : ''}> إصلاح تلقائي لأي خطأ يظهر أثناء تشغيل اللعبة</label>
+      </div>
       <div class="card"><h3>💾 النسخ الاحتياطي</h3>
         <p class="muted">احفظ كل ألعابك بملف واحد (مثلًا قبل تغيير الجهاز)، أو استرجعها.</p>
         <div class="row"><button class="btn sm" id="backup">تصدير نسخة احتياطية</button>
@@ -244,6 +265,34 @@ function settingsScreen() {
     </main>`;
   bindSegs(app);
   $('[data-seg="effort"]').addEventListener('change', () => settings.set('effort', readSeg(app, 'effort')));
+  const promptUi = () => {
+    const mode = readSeg(app, 'pmode');
+    $('#pextra').hidden = mode !== 'extra';
+    $('#pcustom').hidden = mode !== 'custom';
+    $('#pcopy').hidden = mode !== 'custom';
+  };
+  promptUi();
+  $('[data-seg="pmode"]').addEventListener('change', () => {
+    const mode = readSeg(app, 'pmode');
+    if (mode === 'custom' && !$('#pcustom').value.trim()) $('#pcustom').value = DEFAULT_RULES;
+    settings.set('prompt.mode', mode);
+    settings.set('prompt.custom', $('#pcustom').value);
+    promptUi();
+  });
+  $('#pextra').oninput = () => settings.set('prompt.extra', $('#pextra').value);
+  $('#pcustom').oninput = () => settings.set('prompt.custom', $('#pcustom').value);
+  $('#pcopy').onclick = () => { $('#pcustom').value = DEFAULT_RULES; settings.set('prompt.custom', DEFAULT_RULES); toast('انحطت التعليمات الجاهزة، عدّلها مثل ما تريد'); };
+  $('#pview').onclick = () => sheet(`<div class="row"><h3 class="grow">التعليمات الجاهزة</h3><button class="icon" data-close>✕</button></div>
+    <pre class="stream ltr" style="height:auto;max-height:65vh;overflow:auto;display:block;white-space:pre-wrap">${esc(DEFAULT_RULES)}</pre>`);
+  const bgState = () => {
+    const ok = !android || android.backgroundAllowed?.();
+    $('#bgst').textContent = ok ? '✅ مسموح' : '⚠️ غير مسموح — قد ينقطع الشغل إذا طلعت';
+    $('#bg').hidden = !!ok;
+  };
+  bgState();
+  $('#bg').onclick = () => { android?.requestBackground?.(); setTimeout(bgState, 1500); };
+  document.addEventListener('visibilitychange', () => { if (!document.hidden && $('#bgst')) bgState(); });
+  $('#autofix').onchange = (e) => settings.set('autofix', e.target.checked);
   $('#back').onclick = () => history.back();
   $('#pb').onclick = () => pickModel('build', settingsScreen);
   $('#pa').onclick = () => pickModel('auto', settingsScreen);
@@ -318,6 +367,8 @@ export function saveFile(name, content, mime, { downloads = false } = {}) {
 /* ── البدء ─────────────────────────────────────────────── */
 
 loadProbe().catch(() => {});
+// مواصفات الهاتف (الشاشة، المعالج الرسومي، WebGL) تُرسل للنموذج حتى يكتب لعبة تناسبه
+try { settings.set('device', deviceInfo()); } catch { /* غير ضروري */ }
 // تحديث قائمة OpenRouter بالخلفية مرة باليوم
 refreshOpenRouter().catch(() => {});
 route();

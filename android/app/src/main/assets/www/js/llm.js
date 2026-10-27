@@ -8,13 +8,52 @@ export class StopError extends Error {
   constructor() { super('أُوقفت العملية'); this.stop = true; }
 }
 
+/** خطأ مؤقت (انقطاع نت، خادم مشغول): يُعاد الطلب تلقائيًا بدل إفشال العملية. */
+function temporary(message) {
+  return Object.assign(new Error(message), { retryable: true });
+}
+
+function pause(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new StopError());
+    const t = setTimeout(done, ms);
+    function done() { signal?.removeEventListener('abort', stop); resolve(); }
+    function stop() { clearTimeout(t); reject(new StopError()); }
+    signal?.addEventListener('abort', stop, { once: true });
+  });
+}
+
+/** ينتظر رجوع الإنترنت (حتى 30 دقيقة). */
+function online(signal) {
+  if (navigator.onLine) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(done, 30 * 60e3);
+    function done() { clearTimeout(t); removeEventListener('online', done); signal?.removeEventListener('abort', stop); resolve(); }
+    function stop() { clearTimeout(t); removeEventListener('online', done); reject(new StopError()); }
+    addEventListener('online', done);
+    signal?.addEventListener('abort', stop, { once: true });
+  });
+}
+
+const ATTEMPTS = 6;
+
 /**
  * parts: [{ text, cache? } | { image: base64Jpeg }]
  * يرجع { text, usage: {input, output, cacheRead, cacheWrite}, cost, stop, model }
+ * إن انقطع الاتصال أو انشغل الخادم ينتظر ويعيد المحاولة حتى 6 مرات (onRetry يُبلغ الواجهة).
  */
-export async function complete({ model, system, parts, maxTokens, effort, signal, onText, onThinking }) {
-  if (model.provider === 'anthropic') return claude({ model, system, parts, maxTokens, effort, signal, onText, onThinking });
-  return openRouter({ model, system, parts, maxTokens, signal, onText, onThinking });
+export async function complete(opts) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return opts.model.provider === 'anthropic' ? await claude(opts) : await openRouter(opts);
+    } catch (e) {
+      if (e.stop || !e.retryable) throw e;
+      if (attempt >= ATTEMPTS) throw Object.assign(new Error('تعذر الاتصال بعد عدة محاولات: ' + e.message), { network: true });
+      opts.onRetry?.(attempt, ATTEMPTS - 1, e.message);
+      await online(opts.signal);
+      await pause(Math.min(30000, 2500 * 2 ** (attempt - 1)) * (e.slow ? 4 : 1), opts.signal);
+    }
+  }
 }
 
 /* ── Claude (Anthropic SDK) ─────────────────────────────── */
@@ -25,27 +64,30 @@ function anthropic() {
   if (!key) throw new Error('أضف مفتاح كلود من الإعدادات.');
   if (!client || clientKey !== key) {
     // المفتاح للمستخدم نفسه ومحفوظ على جهازه فقط، لذلك الاتصال المباشر من التطبيق مقبول هنا
-    client = new window.Anthropic({ apiKey: key, dangerouslyAllowBrowser: true, maxRetries: 3 });
+    client = new window.Anthropic({ apiKey: key, dangerouslyAllowBrowser: true, maxRetries: 2 });
     clientKey = key;
   }
   return client;
 }
 
-function claudeError(e) {
+function claudeError(e, signal) {
   const A = window.Anthropic;
-  if (e instanceof A.APIUserAbortError) return new StopError();
+  if (signal?.aborted || e instanceof A.APIUserAbortError) return new StopError();
   if (e instanceof A.AuthenticationError) return new Error('مفتاح كلود غير صحيح (401). راجعه بالإعدادات.');
   if (e instanceof A.PermissionDeniedError) return new Error('المفتاح لا يملك صلاحية هذا النموذج (403).');
   if (e instanceof A.NotFoundError) return new Error('النموذج غير موجود لهذا المفتاح (404). اختر نموذجًا آخر.');
-  if (e instanceof A.RateLimitError) return new Error('تجاوزت حد الطلبات أو الرصيد (429). انتظر قليلًا أو اشحن الحساب.');
+  if (e instanceof A.RateLimitError) return Object.assign(temporary('تجاوزت حد الطلبات مؤقتًا (429)'), { slow: true });
   if (e instanceof A.BadRequestError) {
     const msg = e.error?.error?.message || e.message;
     if (/credit balance/i.test(msg)) return new Error('رصيد حساب Anthropic لا يكفي. اشحنه من console.anthropic.com.');
     return new Error('طلب مرفوض (400): ' + msg);
   }
-  if (e instanceof A.InternalServerError) return new Error('خوادم Anthropic مشغولة الآن. جرّب بعد قليل.');
-  if (e instanceof A.APIConnectionError) return new Error('تعذر الاتصال بالإنترنت.');
-  if (e instanceof A.APIError) return new Error(`خطأ ${e.status}: ${e.message}`);
+  if (e instanceof A.InternalServerError) return temporary('خوادم Anthropic مشغولة');
+  if (e instanceof A.APIConnectionError) return temporary('انقطع الاتصال');
+  // خطأ داخل البث بلا رمز حالة (مثل overloaded_error) مؤقت أيضًا
+  if (e instanceof A.APIError) return e.status ? new Error(`خطأ ${e.status}: ${e.message}`) : temporary(e.message);
+  // انقطاع الشبكة أثناء قراءة البث يظهر كـ TypeError
+  if (e instanceof TypeError) return temporary('انقطع الاتصال أثناء الاستلام');
   return e;
 }
 
@@ -75,7 +117,7 @@ async function claude({ model, system, parts, maxTokens, effort, signal, onText,
     stream.on('thinking', (t) => onThinking?.(t));
     msg = await stream.finalMessage();
   } catch (e) {
-    throw claudeError(e);
+    throw claudeError(e, signal);
   }
   if (msg.stop_reason === 'refusal') {
     throw new Error('النموذج رفض هذا الطلب' + (msg.stop_details?.explanation ? ': ' + msg.stop_details.explanation : '.') + ' غيّر الوصف وجرّب مرة ثانية.');
@@ -122,7 +164,8 @@ async function orError(res) {
   switch (res.status) {
     case 401: return new Error('مفتاح OpenRouter غير صحيح (401).');
     case 402: return new Error('رصيد محفظة OpenRouter لا يكفي (402). اشحنها أو اختر نموذجًا أرخص.');
-    case 429: return new Error('طلبات كثيرة (429). انتظر قليلًا.');
+    case 429: return Object.assign(temporary('طلبات كثيرة (429)'), { slow: true });
+    case 408: case 500: case 502: case 503: case 504: return temporary(`خادم OpenRouter مشغول (${res.status}) ${msg}`);
     default: return new Error(`خطأ OpenRouter ${res.status}: ${msg}`);
   }
 }
@@ -148,8 +191,8 @@ async function openRouter({ model, system, parts, maxTokens, signal, onText, onT
   try {
     res = await fetch(OR + '/chat/completions', { method: 'POST', headers: orHeaders(), body: JSON.stringify(body), signal });
   } catch (e) {
-    if (e.name === 'AbortError') throw new StopError();
-    throw new Error('تعذر الاتصال بالإنترنت.');
+    if (signal?.aborted || e.name === 'AbortError') throw new StopError();
+    throw temporary('تعذر الاتصال بالإنترنت');
   }
   if (!res.ok) throw await orError(res);
 
@@ -170,7 +213,8 @@ async function openRouter({ model, system, parts, maxTokens, signal, onText, onT
         if (data === '[DONE]') continue;
         let j;
         try { j = JSON.parse(data); } catch { continue; }
-        if (j.error) throw new Error('OpenRouter: ' + (j.error.message || 'خطأ أثناء البث'));
+        // خطأ من المزود أثناء البث (غالبًا مؤقت): يُعاد الطلب
+        if (j.error) throw temporary('OpenRouter: ' + (j.error.message || 'خطأ أثناء البث'));
         if (j.model) served = j.model;
         const ch = j.choices?.[0];
         const d = ch?.delta;
@@ -181,8 +225,9 @@ async function openRouter({ model, system, parts, maxTokens, signal, onText, onT
       }
     }
   } catch (e) {
-    if (e.name === 'AbortError') throw new StopError();
-    throw e;
+    if (signal?.aborted || e.name === 'AbortError') throw new StopError();
+    if (e.retryable) throw e;
+    throw temporary('انقطع الاتصال أثناء الاستلام');
   }
   const u = { input: usage?.prompt_tokens || 0, output: usage?.completion_tokens || 0, cacheRead: 0, cacheWrite: 0 };
   const cost = typeof usage?.cost === 'number' ? usage.cost : costOf(model, u);

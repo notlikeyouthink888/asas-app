@@ -113,3 +113,26 @@ export function roadmapProgress(roadmap) {
 }
 
 export const android = window.Android || null;
+
+/** وصف الهاتف للنموذج: الشاشة، المعالج، الذاكرة، ودعم WebGL والمعالج الرسومي. ثابت لكل جهاز فلا يفسد التخزين المؤقت. */
+export function deviceInfo() {
+  let gl = null, gl2 = false, gpu = '', maxTex = 0;
+  try {
+    const c = document.createElement('canvas');
+    gl = c.getContext('webgl2');
+    gl2 = !!gl;
+    if (!gl) gl = c.getContext('webgl');
+    if (gl) {
+      const ext = gl.getExtension('WEBGL_debug_renderer_info');
+      gpu = String(ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER));
+      maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+      gl.getExtension('WEBGL_lose_context')?.loseContext();
+    }
+  } catch { /* بلا WebGL */ }
+  const chrome = (/Chrome\/(\d+)/.exec(navigator.userAgent) || [])[1] || '?';
+  const webgl = gl
+    ? `${gl2 ? 'WebGL2 + WebGL1 available' : 'WebGL1 only (no WebGL2)'}${gpu ? `, GPU: ${gpu}` : ''}${maxTex ? `, max texture ${maxTex}` : ''}`
+    : 'NOT available on this phone: do not use three.js/WebGL, use Canvas 2D';
+  return `- Screen ${Math.min(screen.width, screen.height)}x${Math.max(screen.width, screen.height)} CSS px, devicePixelRatio ${devicePixelRatio}, ${navigator.hardwareConcurrency || '?'} CPU cores, ${navigator.deviceMemory || '?'} GB RAM\n`
+    + `- WebGL: ${webgl}\n- Android WebView, Chromium ${chrome}`;
+}

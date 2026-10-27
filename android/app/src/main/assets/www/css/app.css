@@ -57,6 +57,9 @@ p { margin: 0 0 8px; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); padding: 14px; display: flex; flex-direction: column; gap: 10px; }
 .card.warn { border-color: #6b5420; background: #231d10; }
 .card.err { border-color: #6b2632; background: #22131a; }
+details.card summary { cursor: pointer; font-weight: 600; }
+details.card[open] summary { margin-bottom: 4px; }
+label.row input[type=checkbox] { width: 20px; height: 20px; accent-color: var(--accent); }
 
 input[type=text], input[type=password], input[type=number], textarea, select {
   width: 100%; background: #0c0e14; border: 1px solid var(--line); border-radius: 12px; padding: 11px 12px; outline: none;

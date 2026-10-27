@@ -1,10 +1,12 @@
 package com.asas.gamestudio
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.content.ActivityNotFoundException
 import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.ActivityInfo
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Rect
 import android.net.Uri
@@ -12,7 +14,9 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.provider.MediaStore
+import android.provider.Settings
 import android.util.Base64
 import android.util.Log
 import android.view.PixelCopy
@@ -28,6 +32,7 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -47,8 +52,11 @@ class MainActivity : ComponentActivity() {
     private lateinit var web: WebView
     private val main = Handler(Looper.getMainLooper())
 
-    // أثناء التطوير التلقائي لا نوقف الـ WebView حين يخرج المستخدم مؤقتًا من التطبيق
+    // أثناء صنع لعبة أو تطويرها لا نوقف الـ WebView حين يخرج المستخدم من التطبيق،
+    // وخدمة StudioService الأمامية تمنع أندرويد من تجميد التطبيق فيبقى الاتصال قائمًا
     @Volatile private var busy = false
+
+    private val askNotifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
     private var fileCallback: ValueCallback<Array<Uri>>? = null
     private val pickFile = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
@@ -67,6 +75,8 @@ class MainActivity : ComponentActivity() {
 
         web = WebView(this)
         setContentView(web)
+        // عملية رسم الصفحة تبقى بأولوية عالية حتى لو التطبيق بالخلفية
+        web.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
 
         web.settings.apply {
             javaScriptEnabled = true
@@ -150,6 +160,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        StudioService.stop(this)
         web.destroy()
         super.onDestroy()
     }
@@ -157,12 +168,66 @@ class MainActivity : ComponentActivity() {
     /** ما تستدعيه الواجهة عبر window.Android (يعمل على خيط خلفي، فواجهة النظام تمر عبر main). */
     inner class Bridge {
 
+        /** بداية ونهاية عمل طويل: يشغّل الخدمة الأمامية (الإشعار) ويبقي الشاشة مضاءة ما دام التطبيق ظاهرًا. */
         @JavascriptInterface
-        fun keepAwake(on: Boolean) {
+        fun busy(on: Boolean, text: String) {
             busy = on
             main.post {
-                if (on) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                if (on) {
+                    window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    try {
+                        StudioService.start(this@MainActivity, text)
+                    } catch (e: Exception) {
+                        Log.w("GameStudio", "service", e)
+                    }
+                } else {
+                    window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    StudioService.stop(this@MainActivity)
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun keepAwake(on: Boolean) = busy(on, "جاري العمل على اللعبة…")
+
+        /** نص المرحلة الحالية في الإشعار. */
+        @JavascriptInterface
+        fun progress(text: String) = StudioService.update(this@MainActivity, text)
+
+        /** إشعار «اكتمل» يظهر حتى لو المستخدم خارج التطبيق. */
+        @JavascriptInterface
+        fun notifyDone(title: String, text: String) = StudioService.done(this@MainActivity, title, text)
+
+        @JavascriptInterface
+        fun notificationsAllowed(): Boolean =
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+                ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+
+        @JavascriptInterface
+        fun requestNotifications() {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                main.post { askNotifications.launch(Manifest.permission.POST_NOTIFICATIONS) }
+            }
+        }
+
+        /** هل التطبيق مستثنى من توفير البطارية (فيعمل بالخلفية بلا قيود)؟ */
+        @JavascriptInterface
+        fun backgroundAllowed(): Boolean {
+            val pm = getSystemService(POWER_SERVICE) as PowerManager
+            return pm.isIgnoringBatteryOptimizations(packageName)
+        }
+
+        @JavascriptInterface
+        fun requestBackground() {
+            main.post {
+                try {
+                    startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+                } catch (_: ActivityNotFoundException) {
+                    try {
+                        startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                    } catch (_: ActivityNotFoundException) {
+                    }
+                }
             }
         }
 
