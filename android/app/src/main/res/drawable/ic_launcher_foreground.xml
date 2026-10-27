@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- يد تحكم ونجمة (رمز الذكاء الاصطناعي) -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M36,44h36c7.7,0 14,6.3 14,14v4c0,7.2 -5.8,13 -13,13c-4.1,0 -7.9,-1.9 -10.3,-5.2L60,66H48l-2.7,3.8C42.9,73.1 39.1,75 35,75c-7.2,0 -13,-5.8 -13,-13v-4C22,50.3 28.3,44 36,44z" />
+    <path
+        android:fillColor="#5B4BDB"
+        android:pathData="M35,51h4v6h6v4h-6v6h-4v-6h-6v-4h6z" />
+    <path
+        android:fillColor="#5B4BDB"
+        android:pathData="M71,53a3,3 0,1 1,0 6a3,3 0,1 1,0 -6zM77,59a3,3 0,1 1,0 6a3,3 0,1 1,0 -6z" />
+    <path
+        android:fillColor="#FFD54F"
+        android:pathData="M54,26l2.6,6.4L63,35l-6.4,2.6L54,44l-2.6,-6.4L45,35l6.4,-2.6z" />
+</vector>

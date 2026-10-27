@@ -1,0 +1,62 @@
+name: Android APK
+
+# يبني تطبيق «استوديو الألعاب» وينشره كإصدار على GitHub Releases عند أي تغيير في مجلد android
+on:
+  push:
+    paths:
+      - 'android/**'
+      - '.github/workflows/android.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Check web app syntax
+        working-directory: android/app/src/main/assets/www
+        run: for f in js/*.js; do node --check --input-type=module < "$f" || exit 1; done
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Build APK
+        working-directory: android
+        run: gradle assembleRelease --no-daemon --stacktrace
+
+      - name: Name APK
+        run: cp android/app/build/outputs/apk/release/app-release.apk "GameStudio-${{ github.run_number }}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GameStudio-apk
+          path: GameStudio-*.apk
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: android-v${{ github.run_number }}
+          name: استوديو الألعاب 1.0.${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          files: GameStudio-*.apk
+          body: |
+            تطبيق أندرويد «استوديو الألعاب»: اوصف اللعبة والذكاء الاصطناعي يصممها ويبنيها ويطوّرها.
+            نزّل ملف APK من الأسفل وثبّته على الموبايل (اسمح بالتثبيت من مصادر غير معروفة إذا طلب).
+            التحديث يُثبَّت فوق النسخة القديمة وتبقى ألعابك.
