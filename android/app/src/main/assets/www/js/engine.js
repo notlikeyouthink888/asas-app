@@ -37,13 +37,18 @@ CORRECTNESS (the game must work the first time - test it in your head before ans
   typos, wrong argument order, missing semicolons in tricky places, and code that runs before the elements it needs exist.
 - Start the game from one init function after the page loaded; check every element and API exists before using it.
 - One bad frame must never stop the game loop: keep update/render free of exceptions, guard against NaN and empty arrays.
+- Never read a property of something that may still be undefined (renderer, scene, player, canvas context, DOM elements):
+  create it before any code path can use it.
 - Runtime errors, frame rate and a screenshot of each version are reported back to you automatically; fix every reported problem.
 
 3D WITH three.js ON PHONES
 - Use only three.js r159 core classes (global THREE). OrbitControls, GLTFLoader, EffectComposer and other examples/addons are
   NOT available - write simple equivalents yourself (camera follow, touch drag, etc).
-- Create the renderer inside try/catch: new THREE.WebGLRenderer({ antialias: false, powerPreference: 'default' }). If it fails,
-  draw a 2D fallback or show a clear message with a "retry" button in the player's language - never a blank screen.
+- Create scene, camera and renderer FIRST, before building the UI or starting the loop. Create the renderer inside try/catch:
+  new THREE.WebGLRenderer({ antialias: false, powerPreference: 'default' }); if it throws, wait 400 ms and retry (up to 3 times).
+  If it still fails, show a clear message with a "retry" button in the player's language and RETURN from init: never continue,
+  never start the loop and never touch renderer.* while the renderer is undefined.
+- Start the requestAnimationFrame loop only after init fully succeeded. The title screen must show before any game-over screen.
 - On renderer.domElement listen for 'webglcontextlost' (call event.preventDefault() and pause) and 'webglcontextrestored'
   (rebuild materials/renderer and resume).
 - renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5)); shadows off, or one directional light shadow with a 1024 map;
@@ -115,6 +120,11 @@ Steps:
    for the focus areas: add it to the roadmap first). Make each change complete and polished, not a stub.
 3. Keep everything that already works working. Prefer targeted edits.
 Return <summary>, the updated <roadmap>, and your edits or the full file.`;
+
+const DEEP_FIX_TASK = `Earlier targeted fixes did NOT make the automatic test pass (report below). Step back and find the ROOT CAUSE: usually
+the FIRST error in the report (an object used before it is created, wrong init order, a renamed or missing function, a failed
+WebGL renderer that the code keeps using). Then return the COMPLETE corrected file in <file>, keeping all the game's features,
+and re-read it carefully so no variable, function or property is used before it exists. Return <summary> and <file>.`;
 
 const FIX_TASK = `The current file fails its automatic test (report below). Find the real cause of every error and fix it so the game
 starts and runs correctly. If an error is caused by the environment (for example WebGL could not be created or was lost), make the
@@ -243,33 +253,42 @@ export function describeReport(r, code) {
   if (!r) return 'No test report available.';
   const lines = code.split('\n');
   const out = [];
-  if (r.hidden) out.push('- NOTE: the app was in the background during this test, so the game could not render: only the static syntax check ran. Frame count and screenshot are not meaningful.');
+  if (r.hidden) out.push('- NOTE: the app was in the background during this test: the page was not drawn (the game loop was driven by a timer instead), so frame rate and screenshot are not meaningful. Errors are real.');
   if (r.timeout) out.push('- The page did not respond to the test probe (it may be frozen in an infinite loop).');
-  out.push(`- Runtime errors: ${r.errors.length}`);
-  r.errors.slice(0, 8).forEach((e, i) => {
+  if (r.webgl && r.webgl !== 'not checked') {
+    out.push(`- WebGL inside the game frame on this phone: ${r.webgl}${/NOT|fail/i.test(r.webgl) ? ' -> use Canvas 2D or a 2D fallback' : ' (so WebGL errors below are code problems, not the device)'}`);
+  }
+  const errs = [...r.errors].sort((a, b) => (a.t || 0) - (b.t || 0));
+  out.push(`- Runtime errors: ${errs.length}${errs.length > 1 ? ' (in the order they happened; the FIRST one is usually the root cause)' : ''}`);
+  errs.slice(0, 8).forEach((e, i) => {
     out.push(`  ${i + 1}. [${e.kind}] ${e.msg}${e.line ? ` (line ${e.line}:${e.col})` : ''}${e.count > 1 ? ` x${e.count}` : ''} at ${e.t}ms`);
+    const ctx = i < 3 ? 4 : 2;
     if (e.line && lines[e.line - 1] !== undefined) {
-      for (let n = Math.max(1, e.line - 2); n <= Math.min(lines.length, e.line + 2); n++) {
+      for (let n = Math.max(1, e.line - ctx); n <= Math.min(lines.length, e.line + ctx); n++) {
         out.push(`     ${n === e.line ? '>' : ' '}${n}| ${lines[n - 1].slice(0, 160)}`);
       }
-    } else if (e.stack) out.push('     ' + e.stack.split('\n').slice(0, 3).join(' | '));
+    }
+    const frames = String(e.stack || '').split('\n').map((l) => l.trim()).filter((l) => l.startsWith('at ')).slice(0, 4);
+    if (frames.length) out.push('     call stack: ' + frames.join(' <- ').replace(/\(?about:srcdoc:/g, '(line ').slice(0, 400));
+    if (/Cannot read properties of (undefined|null)|is not defined|is not a function/.test(e.msg)) {
+      out.push('     hint: something is used before it was created (init order), misnamed, or its creation failed and the code went on.');
+    }
   });
-  if (r.errors.some((e) => e.kind === 'webgl')) {
-    out.push('  (WebGL errors can come from the phone limiting GPU contexts: the game must recover - retry creating the renderer, handle context loss, or fall back - not crash or show a blank screen.)');
+  if (errs.some((e) => e.kind === 'webgl')) {
+    out.push('  (WebGL errors: the game must recover - retry creating the renderer, handle context loss, or fall back - not crash or show a blank screen.)');
   }
+  const secs = (r.uptime || 1) / 1000;
+  out.push(r.frames > 0
+    ? `- Game loop (requestAnimationFrame): running${r.hidden ? '' : `, about ${Math.round(r.frames / secs)} fps over ${secs.toFixed(1)}s`}`
+    : '- Game loop (requestAnimationFrame): NO frames (if the game uses rAF, its loop never started or it crashed)');
   if (!r.hidden) {
-    const secs = (r.uptime || 1) / 1000;
-    const fps = r.frames / secs;
-    out.push(r.frames > 0
-      ? `- requestAnimationFrame loop: running, about ${Math.round(fps)} fps over ${secs.toFixed(1)}s`
-      : '- requestAnimationFrame loop: NO frames (if the game uses rAF, its loop never started or stopped)');
     if (r.canvases?.length) {
       out.push('- Canvases: ' + r.canvases.map((c) => `${c.type || '?'} ${c.w}x${c.h} shown ${c.cw}x${c.ch}${c.blank ? ' (BLANK, single color)' : ''}`).join('; '));
     } else out.push('- No <canvas> on the page.');
     out.push(`- Viewport ${r.vw}x${r.vh}, page scroll size ${r.scrollW}x${r.scrollH}${r.scrollH > r.vh + 4 || r.scrollW > r.vw + 4 ? ' (OVERFLOWS the screen)' : ''}`);
-    out.push(`- Buttons: ${r.buttons}. Visible text: "${r.text || ''}"`);
-    out.push('- Simulated input during the test: taps at center and bottom corners, Enter, Space, arrows.');
   }
+  out.push(`- Buttons: ${r.buttons}. Visible text: "${r.text || ''}"`);
+  out.push('- Simulated input during the test: a button click, taps at center and bottom corners, Enter, Space, arrows, then the last visible button.');
   out.push(`- Screenshot: ${r.shot ? 'attached (taken after the simulated input)' : 'not available'}`);
   return out.join('\n');
 }
@@ -277,7 +296,7 @@ export function describeReport(r, code) {
 /** هل اللعبة معطلة فعلًا؟ (تحذيرات console وفشل تحميل ملف لا تكفي وحدها) */
 export function isBroken(r) {
   if (!r) return false;
-  const serious = r.errors.filter((e) => e.kind !== 'console' && e.kind !== 'resource' && !(r.hidden && e.kind === 'webgl'));
+  const serious = r.errors.filter((e) => e.kind !== 'console' && e.kind !== 'resource');
   return (!r.hidden && r.timeout) || serious.length > 0 || r.errors.length >= 3;
 }
 
@@ -389,16 +408,23 @@ async function change(ctx, project, code, task, { report, shot, label }) {
  * يختبر الكود ويصلحه حتى maxFixes مرات. لا يرمي أبدًا بسبب فشل الإصلاح نفسه:
  * يرجع أفضل كود وصل له حتى لا يضيع عمل طويل (فقط الإيقاف أو الحد المالي أو انقطاع النت الدائم يوقفه).
  */
-async function testAndFix(ctx, project, code, { maxFixes = 2, capture = false } = {}) {
-  ctx.ui.phase?.('اختبار اللعبة…');
-  let report = await runTest(ctx, code, { capture });
-  let fixes = 0;
-  while (isBroken(report) && fixes < maxFixes) {
-    fixes++;
-    ctx.ui.log?.(`🔧 الاختبار لگى ${report.errors.length} مشكلة، إصلاح ${fixes}/${maxFixes}`);
+async function testAndFix(ctx, project, code, { maxFixes = 2, capture = false, deep = false, report = null, note = '' } = {}) {
+  if (!report) {
+    ctx.ui.phase?.('اختبار اللعبة…');
+    report = await runTest(ctx, code, { capture });
+  }
+  let summary = null;
+  const total = maxFixes + (deep ? 1 : 0);
+  for (let fixes = 1; isBroken(report) && fixes <= total; fixes++) {
+    const rewrite = deep && fixes === total;
+    ctx.ui.log?.(rewrite
+      ? `🛠️ الإصلاحات الصغيرة ما كفت، أطلب مراجعة كاملة للكود وإعادة كتابته (${fixes}/${total})`
+      : `🔧 الاختبار لگى ${report.errors.length} مشكلة: ${report.errors[0]?.msg?.slice(0, 80) || ''} — إصلاح ${fixes}/${total}`);
     let r;
     try {
-      r = await change(ctx, project, code, FIX_TASK, { report: describeReport(report, code), shot: report.shot, label: `إصلاح الأخطاء (${fixes}/${maxFixes})` });
+      r = await change(ctx, project, code, (rewrite ? DEEP_FIX_TASK : FIX_TASK) + note, {
+        report: describeReport(report, code), shot: report.shot, label: rewrite ? 'مراجعة كاملة وإصلاح…' : `إصلاح الأخطاء (${fixes}/${total})`,
+      });
     } catch (e) {
       if (e.stop || e.budget || e.network) throw e;
       ctx.ui.log?.('⚠️ محاولة الإصلاح ما نجحت: ' + e.message);
@@ -408,9 +434,17 @@ async function testAndFix(ctx, project, code, { maxFixes = 2, capture = false } 
     ctx.ui.phase?.('اختبار بعد الإصلاح…');
     const next = await runTest(ctx, r.code, { capture });
     // لا نقبل إصلاحًا يزيد الأخطاء
-    if (!isBroken(next) || next.errors.length <= report.errors.length) { code = r.code; report = next; }
+    if (!isBroken(next) || next.errors.length <= report.errors.length) { code = r.code; report = next; summary = r.summary || summary; }
   }
-  return { code, report, fixes };
+  return { code, report, summary };
+}
+
+/** يحفظ إصدارًا ويعلّمه «يحتاج تحقق» إن اختُبر والتطبيق بالخلفية أو بقيت فيه أخطاء. */
+function save(project, code, note, ctx, report) {
+  const n = addVersion(project, code, note, ctx.spent);
+  project.lastReport = slim(report);
+  project.verify = report?.hidden || isBroken(report) ? n : null;
+  return n;
 }
 
 /**
@@ -442,10 +476,9 @@ export async function createGame(ctx, project) {
     ctx.ui.log?.(`💾 انكتب الكود (${b.file.split('\n').length} سطر)، الآن الاختبار`);
   } else ctx.ui.log?.('💾 الكود محفوظ من المحاولة السابقة، أكمل من الاختبار');
 
-  const t = await testAndFix(ctx, project, project.draft.code, { capture: true, maxFixes: 3 });
-  addVersion(project, t.code, project.draft.summary || 'الإصدار الأول', ctx.spent);
+  const t = await testAndFix(ctx, project, project.draft.code, { capture: true, maxFixes: 3, deep: true });
+  save(project, t.code, project.draft.summary || 'الإصدار الأول', ctx, t.report);
   delete project.draft;
-  project.lastReport = slim(t.report);
   project.status = 'ready';
   await projects.put(project);
   return t;
@@ -458,28 +491,36 @@ export async function improveGame(ctx, project, request) {
     report: describeReport(before, project.code), shot: before.shot, label: 'تنفيذ طلبك…',
   });
   if (r.roadmap) project.roadmap = r.roadmap;
-  const t = await testAndFix(ctx, project, r.code, { maxFixes: 3 });
+  const t = await testAndFix(ctx, project, r.code, { maxFixes: 3, deep: true });
   if (isBroken(t.report) && !isBroken(before)) {
     throw new Error('التعديل كسر اللعبة ولم ينجح إصلاحه، فبقيت النسخة السابقة كما هي. جرّب صياغة أخرى.');
   }
-  addVersion(project, t.code, r.summary || request.slice(0, 80), ctx.spent);
-  project.lastReport = slim(t.report);
+  save(project, t.code, r.summary || request.slice(0, 80), ctx, t.report);
   await projects.put(project);
   return { ...t, summary: r.summary };
 }
 
-/** إصلاح أخطاء ظهرت أثناء اللعب (يُستدعى تلقائيًا). */
-export async function fixGame(ctx, project, errors) {
-  const report = { errors, frames: 1, uptime: 1000, canvases: [], text: '', buttons: 0, vw: 0, vh: 0, scrollW: 0, scrollH: 0 };
-  const r = await change(ctx, project, project.code, FIX_TASK + '\nThese errors appeared while the owner was playing.', {
-    report: describeReport(report, project.code), label: 'إصلاح أخطاء ظهرت أثناء اللعب…',
+/**
+ * إصلاح تلقائي: اختبار حقيقي (مع أخطاء ظهرت أثناء اللعب إن وجدت) ← إصلاحات ← مراجعة كاملة إن لزم.
+ * يُستخدم أيضًا للتحقق من إصدار انحفظ والتطبيق بالخلفية.
+ */
+export async function fixGame(ctx, project, playErrors = []) {
+  const report = await runTest(ctx, project.code, { capture: true });
+  for (const e of playErrors) if (!report.errors.some((x) => x.msg === e.msg)) report.errors.push({ ...e, kind: e.kind || 'error' });
+  if (!isBroken(report)) {
+    project.verify = report.hidden ? project.verify : null;
+    return { report, fixed: false, ok: true };
+  }
+  const t = await testAndFix(ctx, project, project.code, {
+    report, capture: true, maxFixes: 2, deep: true,
+    note: playErrors.length ? '\nSome of these errors appeared while the owner was playing.' : '',
   });
-  const t = await testAndFix(ctx, project, r.code, { maxFixes: 2 });
-  if (isBroken(t.report) && t.report.errors.length >= errors.length) throw new Error('ما گدرت أصلح الأخطاء تلقائيًا هالمرة. جرّب «اطلب إصلاحها» أو التطوير التلقائي.');
-  addVersion(project, t.code, '🔧 ' + (r.summary || 'إصلاح تلقائي لأخطاء أثناء اللعب'), ctx.spent);
-  project.lastReport = slim(t.report);
+  if (t.code === project.code) {
+    throw new Error('ما گدرت أصلح أخطاء اللعبة هالمرة: ' + (t.report.errors[0]?.msg || '') + '. جرّب «اطلب إصلاحها» أو اختر نموذجًا أقوى من الإعدادات.');
+  }
+  save(project, t.code, '🔧 ' + (t.summary || 'إصلاح أخطاء اللعبة'), ctx, t.report);
   await projects.put(project);
-  return { ...t, summary: r.summary };
+  return { ...t, fixed: true, ok: !isBroken(t.report) };
 }
 
 /** 3) التطوير التلقائي: جولات متتالية، كل جولة تختبر وتطور وتحفظ إصدارًا (أو تتراجع إن انكسرت اللعبة). */
@@ -507,8 +548,7 @@ export async function autoDevelop(ctx, project, { rounds, focus }) {
       continue;
     }
     if (r.roadmap) project.roadmap = r.roadmap;
-    const n = addVersion(project, t.code, `🤖 ${r.summary || 'تطوير تلقائي'}`, ctx.spent);
-    project.lastReport = slim(t.report);
+    const n = save(project, t.code, `🤖 ${r.summary || 'تطوير تلقائي'}`, ctx, t.report);
     await projects.put(project);
     history.push(`- round ${i}: ${r.summary || 'improved the game'}`);
     ctx.ui.log?.(`✅ الجولة ${i} ← الإصدار ${n}: ${r.summary || ''}`);

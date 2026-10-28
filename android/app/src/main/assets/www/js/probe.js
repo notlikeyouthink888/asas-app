@@ -58,13 +58,36 @@
   window.prompt = function () { return null; };
 
   var raf = window.requestAnimationFrame.bind(window);
+  var caf = window.cancelAnimationFrame.bind(window);
+  var timerFrames = {};
+  function tick(cb, t) { if (t !== lastT) { lastT = t; frames++; } cb(t); }
   window.requestAnimationFrame = function (cb) {
-    return raf(function (t) { if (t !== lastT) { lastT = t; frames++; } cb(t); });
+    /* أثناء الاختبار والتطبيق بالخلفية لا يرسم المتصفح، فنشغّل حلقة اللعبة بمؤقت حتى تظهر أخطاؤها */
+    if (CFG.test && document.hidden) {
+      var id = setTimeout(function () { delete timerFrames[id]; tick(cb, performance.now()); }, 16);
+      timerFrames[id] = 1;
+      return id;
+    }
+    return raf(function (t) { tick(cb, t); });
+  };
+  window.cancelAnimationFrame = function (id) {
+    if (timerFrames[id]) { delete timerFrames[id]; clearTimeout(id); } else caf(id);
   };
 
   var ctxType = new WeakMap();
   var glContexts = [];
   var getCtx = HTMLCanvasElement.prototype.getContext;
+  /* هل WebGL يعمل داخل إطار اللعبة نفسه؟ يفرّق بين خطأ في الكود ومشكلة في الجهاز */
+  var glInfo = 'not checked';
+  if (CFG.test) {
+    try {
+      var tc = document.createElement('canvas');
+      var g = getCtx.call(tc, 'webgl2'), v = 'WebGL2';
+      if (!g) { g = getCtx.call(tc, 'webgl'); v = g ? 'WebGL1 only' : 'NOT available'; }
+      glInfo = v;
+      if (g) { var lx = g.getExtension('WEBGL_lose_context'); if (lx) lx.loseContext(); }
+    } catch (e) { glInfo = 'check failed: ' + e.message; }
+  }
   HTMLCanvasElement.prototype.getContext = function (type) {
     var c = getCtx.apply(this, arguments);
     var t = String(type);
@@ -120,6 +143,8 @@
       canvases: cs,
       text: ((b && b.innerText) || '').replace(/\s+/g, ' ').trim().slice(0, 300),
       buttons: document.querySelectorAll('button,[onclick],[role=button]').length,
+      webgl: glInfo,
+      hidden: document.hidden,
       vw: innerWidth, vh: innerHeight,
       scrollW: document.documentElement.scrollWidth, scrollH: document.documentElement.scrollHeight
     };
@@ -164,6 +189,11 @@
     steps.push(function () { tap(w * 0.75, h * 0.8); });
     steps.push(function () { key('ArrowUp', 'ArrowUp'); });
     steps.push(function () { tap(w / 2, h * 0.3); });
+    /* زر ظاهر بعد ذلك (إعادة المحاولة، التالي...) يُضغط أيضًا حتى تُختبر إعادة التشغيل */
+    steps.push(function () {
+      var bs = Array.prototype.slice.call(document.querySelectorAll('button:not([disabled]),[role=button]')).filter(function (b) { return b.offsetParent !== null; });
+      if (bs.length) { try { bs[bs.length - 1].click(); } catch (e) {} }
+    });
     steps.forEach(function (f, i) { setTimeout(f, i * 160); });
   }
 

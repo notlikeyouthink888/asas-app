@@ -80,14 +80,13 @@ class Runner {
     return this.load(code, false);
   }
 
-  /** يشغّل اللعبة، يجرب لمسات وأزرارًا، ويرجع تقريرًا (مع لقطة شاشة إن طُلبت). */
+  /**
+   * يشغّل اللعبة، يجرب لمسات وأزرارًا، ويرجع تقريرًا (مع لقطة شاشة إن طُلبت).
+   * يعمل حتى والتطبيق بالخلفية (المِجس يشغّل حلقة اللعبة بمؤقت)، لكن بلا رسم ولا لقطة، فيُعلَّم hidden
+   * ويُعاد التحقق منه تلقائيًا حين ترجع للتطبيق.
+   */
   async test(code, { capture = false } = {}) {
-    // التطبيق بالخلفية: الصفحة لا ترسم ومؤقتاتها بطيئة، فنكتفي بفحص الصياغة (المحرك يضيفه)،
-    // والأخطاء الحقيقية يلتقطها الإصلاح التلقائي عند رجوعك للتطبيق
-    if (document.hidden) {
-      return { hidden: true, errors: [], frames: 0, uptime: 0, canvases: [], text: '', buttons: 0, vw: 0, vh: 0, scrollW: 0, scrollH: 0 };
-    }
-    let hidden = false;
+    let hidden = document.hidden;
     const onVis = () => { if (document.hidden) hidden = true; };
     document.addEventListener('visibilitychange', onVis);
     try {
@@ -113,7 +112,8 @@ class Runner {
       const id = uid();
       this.pending = { id, resolve: (r) => { this.pending = null; resolve(r); } };
       this.frame.contentWindow?.postMessage({ __gsCmd: 'report', id }, '*');
-      setTimeout(() => { if (this.pending?.id === id) this.pending.resolve(null); }, 2500);
+      // بالخلفية المؤقتات أبطأ، فننتظر أكثر قبل أن نعدّ الصفحة متجمدة
+      setTimeout(() => { if (this.pending?.id === id) this.pending.resolve(null); }, document.hidden ? 15000 : 2500);
     });
   }
 }
@@ -127,29 +127,52 @@ function saveSoon() {
 
 /* ── إصلاح تلقائي للأخطاء أثناء اللعب ───────────────────── */
 
+// حد الإصلاحات التلقائية المتتالية لكل لعبة، حتى لا يصرف بلا نهاية إن تعذر الإصلاح
+const AUTO_FIX_LIMIT = 3;
 let autoFixTimer = null;
+
+function autoFixAllowed() {
+  return settings.get('autofix', true) && !op && P?.code && runner && !document.hidden && (P.autoFix?.streak || 0) < AUTO_FIX_LIMIT;
+}
+
+function startAutoFix(errs, why) {
+  const v = P.versions.at(-1);
+  P.autoFix = { v: v.n, streak: (P.autoFix?.streak || 0) + 1 };
+  addChat('sys', why);
+  runOp('fix', modelFor('build'), async (ctx) => {
+    const r = await fixGame(ctx, P, errs);
+    if (!r.fixed) addChat('ai', '✅ تحققت منها وهي تشتغل بدون أخطاء.');
+    else addChat('ai', (r.ok ? '✅ ' : '⚠️ ') + (r.summary || 'صلحت الأخطاء.') + (r.ok ? '' : '\nبقت أخطاء، راح أحاول مرة ثانية من تشغلها.'));
+  });
+}
+
+/** خطأ ظهر أثناء اللعب ← إصلاح تلقائي (مرة لكل إصدار، وحتى 3 مرات متتالية). */
 function maybeAutoFix() {
-  if (!settings.get('autofix', true) || op || !P?.code || !runner || document.hidden) return;
+  if (!autoFixAllowed()) return;
   const v = P.versions?.at(-1);
-  if (!v || P.autoFixedVersion === v.n || runner.code !== P.code) return;
+  if (!v || P.autoFix?.v === v.n || runner.code !== P.code) return;
   if (!runner.errors.some((e) => e.kind !== 'console' && e.kind !== 'resource')) return;
   clearTimeout(autoFixTimer);
   // ننتظر قليلًا حتى تتجمع الأخطاء المرتبطة
   autoFixTimer = setTimeout(() => {
-    if (op || !P || !runner || P.autoFixedVersion === v.n || runner.code !== P.code) return;
-    P.autoFixedVersion = v.n;
+    if (!autoFixAllowed() || P.autoFix?.v === v.n || runner.code !== P.code) return;
     const errs = runner.errors.slice(0, 8);
-    addChat('sys', `🔧 ظهر ${errs.length} خطأ أثناء التشغيل، أصلحه تلقائيًا…`);
-    runOp('fix', modelFor('build'), async (ctx) => {
-      const r = await fixGame(ctx, P, errs);
-      addChat('ai', r.summary || 'صلحت الأخطاء.');
-    });
+    startAutoFix(errs, `🔧 ظهر ${errs.length} خطأ أثناء التشغيل (${errs[0]?.msg?.slice(0, 70) || ''})، أصلحه تلقائيًا…`);
   }, 2500);
 }
 
-// الرجوع للتطبيق: إعادة تشغيل اللعبة إن شُغّلت وهو بالخلفية
+/** إصدار انحفظ بلا اختبار مرئي (التطبيق كان بالخلفية) أو بقيت فيه أخطاء ← نختبره ونصلحه وأنت داخل التطبيق. */
+function maybeVerify() {
+  const v = P?.versions?.at(-1);
+  if (!v || P.verify !== v.n || P.autoFix?.v === v.n || !autoFixAllowed()) return;
+  startAutoFix([], '🔍 أتحقق من اللعبة وهي ظاهرة على الشاشة، وإذا بيها خطأ أصلحه…');
+}
+
+// الرجوع للتطبيق: إعادة تشغيل اللعبة إن شُغّلت وهو بالخلفية، ثم التحقق منها
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden && runner?.replay && !op && P?.code) runner.play(P.code);
+  if (document.hidden || op || !P?.code) return;
+  if (runner?.replay) runner.play(P.code);
+  setTimeout(maybeVerify, 1200);
 });
 
 // رجع الإنترنت بعد أن أوقف انقطاعُه صنعَ لعبة: نكمل تلقائيًا
@@ -211,7 +234,7 @@ export async function projectScreen(app, id) {
   if (sessionStorage.getItem('gs.autobuild') === P.id) {
     sessionStorage.removeItem('gs.autobuild');
     startCreate();
-  }
+  } else setTimeout(maybeVerify, 1500);
 }
 
 export function leaveProject() {
@@ -357,6 +380,7 @@ async function runOp(kind, model, fn) {
   const ac = new AbortController();
   op = { ac, kind };
   const project = P;
+  if (kind !== 'fix') P.autoFix = null;
   android?.busy?.(true, `${P.name}: ${OP_TITLES[kind]}`);
   askBackgroundOnce();
   // إعادة رسم التبويب تخفي ما لا يصلح أثناء العملية (مثل «البناء لم يكتمل») وتُظهر لوحة التقدم
@@ -391,6 +415,7 @@ async function runOp(kind, model, fn) {
       $('#pname').textContent = P.name;
       renderTab();
       if (ctx.spent) addChat('sys', `تكلفة العملية: ${money(ctx.spent)}`);
+      if (!failure) setTimeout(maybeVerify, 1500);
     }
   }
 }
@@ -402,8 +427,11 @@ function startCreate() {
     addChat('sys', P.design ? `▶ ${ctx.model.name} يكمل صنع اللعبة من حيث توقف…` : `🎨 ${ctx.model.name} يصمم اللعبة…`);
     P.status = 'building';
     const t = await createGame(ctx, P);
-    addChat('ai', `${P.versions.at(-1)?.note || 'الإصدار الأول جاهز'}\n\nجرّبها فوق (⛶ العب)، واطلب أي تعديل، أو شغّل التطوير التلقائي.`);
-    if (t.report?.errors?.length) addChat('sys', `بقيت ${t.report.errors.length} ملاحظات بالاختبار — التطوير التلقائي يكدر يصلحها.`);
+    const errs = t.report?.errors || [];
+    const status = t.report?.hidden
+      ? '📱 اختبرتها والتطبيق بالخلفية؛ راح أتحقق منها مرة ثانية أول ما تفتحها.'
+      : errs.length ? `⚠️ بقت ${errs.length} مشكلة (${errs[0].msg.slice(0, 80)})، راح أكمل إصلاحها تلقائيًا.` : '✅ اختبرتها وتشتغل بدون أخطاء.';
+    addChat('ai', `${P.versions.at(-1)?.note || 'الإصدار الأول جاهز'}\n${status}\n\nجرّبها فوق (⛶ العب)، واطلب أي تعديل، أو شغّل التطوير التلقائي.`);
   });
 }
 

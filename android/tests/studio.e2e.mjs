@@ -56,15 +56,41 @@ let dropFirstPlan = true;   // أول طلب خطة ينقطع اتصاله لا
 
 // لعبة تعمل لكن ترمي خطأ أثناء اللعب بعد نصف ثانية (لاختبار الإصلاح التلقائي أثناء اللعب)
 const GAME_LATE_BUG = `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body><canvas id="c"></canvas><script>
+/* BOSSGAME */
 const c = document.getElementById('c'), x = c.getContext('2d');
 c.width = innerWidth; c.height = innerHeight;
 let t = 0;
-function loop() { t++; x.fillStyle = '#063'; x.fillRect(0, 0, c.width, c.height); if (t > 30) spawnBoss(); requestAnimationFrame(loop); }
+function loop() {
+  t++;
+x.fillStyle = '#063';
+  x.fillRect(0, 0, c.width, c.height); if (t > 30) spawnBoss(); requestAnimationFrame(loop);
+}
 requestAnimationFrame(loop);
 </script></body></html>`;
 
+// نفس نمط خطأك: كائن يُستخدم قبل إنشائه (مثل renderer.domElement) فتتوقف اللعبة فورًا
+const GAME_INIT_BUG = `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body><script>
+/* DEEPBUG */
+let game;
+function buildHud() { document.body.appendChild(game.canvas); }
+function init() { buildHud(); game = { canvas: document.createElement('canvas') }; requestAnimationFrame(loop); }
+function loop() { game.canvas.getContext('2d').clearRect(0, 0, 10, 10); requestAnimationFrame(loop); }
+init();
+</script></body></html>`;
+const GAME_INIT_FIXED = GAME_INIT_BUG.replace('function init() { buildHud(); game = { canvas: document.createElement(\'canvas\') };',
+  'function init() { game = { canvas: document.createElement(\'canvas\') }; buildHud();');
+
 function claudeReply(body) {
   const user = JSON.stringify(body.messages);
+  if (user.includes('DEEPBUG')) {
+    if (user.includes('did NOT make the automatic test pass')) { bump('deep'); return `<summary>رتبت التهيئة: اللعبة تنصنع قبل الواجهة.</summary><file>\n${GAME_INIT_FIXED}\n</file>`; }
+    // إصلاح «سطحي» ينطبق لكنه لا يحل المشكلة، فيضطر التطبيق للتصعيد بمراجعة كاملة
+    bump('weakfix');
+    return `<summary>محاولة سطحية.</summary><edit>\n<<<<<<< SEARCH\n/* DEEPBUG */\n=======\n/* DEEPBUG */ /* tried */\n>>>>>>> REPLACE\n</edit>`;
+  }
+  if (user.includes('BOSSGAME') && user.includes('The owner asks')) {
+    return `<summary>غيرت اللون.</summary><edit>\n<<<<<<< SEARCH\nx.fillStyle = '#063';\n=======\nx.fillStyle = '#036';\n>>>>>>> REPLACE\n</edit>`;
+  }
   if (user.includes('WAS CUT OFF')) {
     bump('continue');
     // التكملة تبدأ بتكرار بسيط لآخر سطر (يجب أن يُحذف التكرار عند الوصل)
@@ -314,6 +340,37 @@ check(count.playfix === 1 && fixed.versions.length === 2 && fixed.code.includes(
 await page.waitForTimeout(2500);
 check(await page.isHidden('#errs'), 'بعد الإصلاح التلقائي اللعبة تعمل بلا أخطاء');
 check(count.playfix === 1, 'الإصلاح التلقائي ما يتكرر بحلقة');
+
+// إصدار انحفظ والتطبيق بالخلفية ← تحقق تلقائي أول ما ترجع
+await page.evaluate(() => {
+  Object.defineProperty(document, 'hidden', { configurable: true, get: () => !!window.__hid });
+  Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => (window.__hid ? 'hidden' : 'visible') });
+  window.__hid = true; document.dispatchEvent(new Event('visibilitychange'));
+});
+await page.fill('#req', 'غيّر اللون');
+await page.click('#send');
+await page.waitForFunction(() => document.querySelector('#busy')?.hidden && document.querySelector('#chat')?.textContent.includes('غيرت اللون'), null, { timeout: 60000 });
+await page.evaluate(() => { window.__hid = false; document.dispatchEvent(new Event('visibilitychange')); });
+await page.waitForFunction(() => document.querySelector('#chat')?.textContent.includes('تحققت منها وهي تشتغل'), null, { timeout: 60000 });
+check(true, 'تعديل انحفظ والتطبيق بالخلفية ← انفحص تلقائيًا وهو ظاهر لما رجعت');
+
+// نفس خطأك: كائن يُستخدم قبل إنشائه. الإصلاحات الصغيرة تفشل ← مراجعة كاملة تحل المشكلة
+await page.click('#back');
+await page.setInputFiles('#imp', { name: 'initbug.html', mimeType: 'text/html', buffer: Buffer.from(GAME_INIT_BUG) });
+await page.waitForFunction(() => document.querySelector('#chat')?.textContent.includes('أصلحه تلقائيًا'), null, { timeout: 30000 });
+await page.waitForFunction(() => document.querySelector('#busy')?.hidden && document.querySelector('#chat')?.textContent.includes('رتبت التهيئة'), null, { timeout: 90000 });
+const deepState = (await page.evaluate(async () => {
+  const db = await new Promise((r) => { const q = indexedDB.open('gamestudio'); q.onsuccess = () => r(q.result); });
+  return new Promise((r) => { const q = db.transaction('projects').objectStore('projects').getAll(); q.onsuccess = () => r(q.result); });
+})).find((p) => p.name === 'initbug');
+check(count.weakfix === 2 && count.deep === 1 && deepState.code.includes("game = { canvas: document.createElement('canvas') }; buildHud();"),
+  'إصلاحان سطحيان فشلا ← المراجعة الكاملة صلحت ترتيب التهيئة');
+const deepCall = calls.find((c) => JSON.stringify(c.body.messages).includes('did NOT make the automatic test pass'));
+const deepText = JSON.stringify(deepCall.body.messages);
+check(deepText.includes('WebGL inside the game frame') && deepText.includes('used before it was created') && deepText.includes('call stack'),
+  'تقرير الخطأ فيه: هل WebGL يعمل، تلميح «استُخدم قبل إنشائه»، ومسار الاستدعاء');
+await page.waitForTimeout(2500);
+check(await page.isHidden('#errs'), 'اللعبة بعد المراجعة الكاملة تعمل بلا أخطاء');
 await page.click('#back');
 await page.click('.game:has-text("نجمة الفضاء")');
 await page.waitForSelector('#game');
@@ -328,7 +385,7 @@ await page.waitForTimeout(500);
 await page.screenshot({ path: join(OUT, '10-play.png') });
 
 // خطأ updateEnemies مقصود في الإصدار الأول الوهمي (من داخل اللعبة لا الواجهة)
-const pageErrors = logs.filter((l) => l.startsWith('[pageerror]') && !/updateEnemies|spawnBoss/.test(l));
+const pageErrors = logs.filter((l) => l.startsWith('[pageerror]') && !/updateEnemies|spawnBoss|reading 'canvas'/.test(l));
 check(!pageErrors.length, 'لا أخطاء في واجهة التطبيق' + (pageErrors.length ? ': ' + pageErrors.join(' | ') : ''));
 if (failures) console.log(logs.slice(-30).join('\n'));
 await browser.close();
