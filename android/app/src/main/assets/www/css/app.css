@@ -152,6 +152,9 @@ code { background: #0c0e14; padding: 1px 5px; border-radius: 5px; font-size: 13p
 .sheet.small { margin: auto 16px; border-radius: 18px; }
 .sheet .opt { text-align: start; width: 100%; display: flex; gap: 10px; align-items: flex-start; padding: 10px; border-radius: 12px; background: var(--panel2); border: 1px solid var(--line); }
 .sheet .opt.on { border-color: var(--accent); background: rgba(124, 108, 255, .14); }
+.sheet .opt.off { opacity: .55; }
+.sheet .opt input[type=checkbox] { width: 22px; height: 22px; margin-top: 2px; accent-color: var(--accent); flex: none; }
+.sheet .opt .col { display: flex; flex-direction: column; gap: 4px; }
 .sheet .opt .grow { min-width: 0; }
 .sheet .opt small { color: var(--muted); display: block; }
 .tier { margin-top: 6px; font-size: 13px; color: var(--muted); font-weight: 600; }

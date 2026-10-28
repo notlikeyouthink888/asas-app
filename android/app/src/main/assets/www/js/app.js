@@ -4,6 +4,7 @@ import { $, $$, esc, toast, ask, sheet, modalStack, money, ago, uid, android, de
 import { projects, settings, keys, addVersion } from './store.js';
 import {
   CLAUDE_MODELS, TIERS, openRouterModels, openRouterUpdatedAt, refreshOpenRouter, modelFor, setModelFor,
+  FREE_MODEL, freeChain, setFreeOrder, setFreeEnabled, isFreeEnabled, freeState, freeUsage, freeDailyBlocked, clearFreeState,
 } from './models.js';
 import { claudeModels, openRouterBalance } from './llm.js';
 import { loadProbe, DEFAULT_RULES } from './engine.js';
@@ -189,6 +190,8 @@ export function pickModel(task, done) {
     <div class="tier">Claude مباشرة (مفتاح كلود)</div>
     ${keys.anthropic ? CLAUDE_MODELS.map((m) => modelRow(m, isSel(m))).join('') : '<p class="muted">أضف مفتاح كلود بالإعدادات لتفعيل هذه النماذج.</p>'}
     <div class="tier">OpenRouter ${openRouterUpdatedAt() ? `<span class="muted">(تحدثت ${ago(openRouterUpdatedAt())})</span>` : '<span class="muted">(قائمة احتياطية — حدّثها من الإعدادات)</span>'}</div>
+    ${keys.openrouter ? `<div class="tier">🆓 مجاني</div>${modelRow({ ...FREE_MODEL, note: `${FREE_MODEL.note} (${freeChain().length} نموذج مفعّل)` }, isSel(FREE_MODEL))}
+      <button class="btn sm" id="manageFree">⚙️ أسماء النماذج المجانية وترتيبها</button>` : ''}
     ${keys.openrouter ? TIERS.map((t) => {
       const ms = or.filter((m) => m.tier === t.id);
       return ms.length ? `<div class="tier">${t.label}</div>${ms.map((m) => modelRow(m, isSel(m))).join('')}` : '';
@@ -196,10 +199,11 @@ export function pickModel(task, done) {
     <label class="field">أو اكتب اسم أي نموذج من openrouter.ai/models
       <div class="row"><input type="text" id="custom" class="ltr grow" placeholder="provider/model-name"><button class="btn sm" id="useCustom">استخدم</button></div></label>`;
   const s = sheet(html);
+  $('#manageFree', s.el)?.addEventListener('click', () => { s.close(); freeSheet(() => pickModel(task, done)); });
   s.el.addEventListener('click', (e) => {
     const b = e.target.closest('.opt');
     if (!b) return;
-    const m = [...CLAUDE_MODELS, ...or].find((x) => x.provider === b.dataset.p && x.id === b.dataset.id);
+    const m = [...CLAUDE_MODELS, ...or, FREE_MODEL].find((x) => x.provider === b.dataset.p && x.id === b.dataset.id);
     setModelFor(task, m);
     s.close();
     toast('تم اختيار ' + m.name);
@@ -213,6 +217,58 @@ export function pickModel(task, done) {
     s.close();
     done?.();
   };
+}
+
+/* ── النماذج المجانية: الأسماء والحالة والترتيب ─────────── */
+
+function freeSummary() {
+  const u = freeUsage();
+  const daily = freeDailyBlocked();
+  return `${freeChain().length} نموذج مفعّل · استخدمت اليوم ${u.total} طلب مجاني من هذا التطبيق. `
+    + 'حد OpenRouter للحساب كله: 50 طلب مجاني باليوم (1000 إذا الحساب شحن 10$ ولو مرة)، و20 بالدقيقة.'
+    + (daily ? ` ⛔ خلص حد اليوم، يرجع ${new Date(daily).toLocaleTimeString('ar-IQ', { hour: 'numeric', minute: '2-digit' })}.` : '');
+}
+
+function freeSheet(done) {
+  const render = () => {
+    const list = freeChain({ includeDisabled: true });
+    const u = freeUsage();
+    s.el.innerHTML = `<div class="row"><h3 class="grow">🆓 النماذج المجانية</h3><button class="icon" data-close>✕</button></div>
+      <p class="muted">${esc(freeSummary())}</p>
+      <p class="muted">الترتيب = أي واحد يُجرَّب أول. ↑↓ للتحريك، والمربع للتفعيل. إذا عطلت الكل إلا واحد، يشتغل بس هو.</p>
+      ${list.map((m, i) => {
+        const st = freeState(m.id);
+        const on = isFreeEnabled(m.id);
+        const status = !on ? '⏸️ معطّل' : st ? `⏳ ${st.why} — يرجع ${new Date(st.until).toLocaleTimeString('ar-IQ', { hour: 'numeric', minute: '2-digit' })}` : '✅ جاهز';
+        return `<div class="opt ${on ? '' : 'off'}" data-id="${esc(m.id)}">
+          <input type="checkbox" data-on ${on ? 'checked' : ''}>
+          <span class="grow"><b>${i + 1}. ${esc(m.name)}</b><small class="ltr">${esc(m.id)}</small>
+            <small>${status}${m.ctx ? ` · سياق ${Math.round(m.ctx / 1000)}k` : ''}${m.vision ? ' · 👁' : ''}${u.per[m.id] ? ` · اليوم ${u.per[m.id]} طلب` : ''}</small></span>
+          <span class="col"><button class="btn sm" data-up ${i ? '' : 'disabled'}>↑</button><button class="btn sm" data-down ${i < list.length - 1 ? '' : 'disabled'}>↓</button></span>
+        </div>`;
+      }).join('')}
+      <div class="row"><button class="btn sm" id="fRefresh">🔄 تحديث القائمة</button><button class="btn sm" id="fReset">تصفير الحالات</button>
+        <button class="btn sm" id="fTop">رجّع الترتيب الأصلي</button></div>`;
+  };
+  const s = sheet('', { onClose: done });
+  render();
+  s.el.addEventListener('click', async (e) => {
+    const row = e.target.closest('[data-id]');
+    if (row) {
+      const ids = freeChain({ includeDisabled: true }).map((m) => m.id);
+      const i = ids.indexOf(row.dataset.id);
+      if (e.target.closest('[data-up]') && i > 0) { [ids[i - 1], ids[i]] = [ids[i], ids[i - 1]]; setFreeOrder(ids); render(); }
+      else if (e.target.closest('[data-down]') && i < ids.length - 1) { [ids[i + 1], ids[i]] = [ids[i], ids[i + 1]]; setFreeOrder(ids); render(); }
+      else if (e.target.matches('[data-on]')) { setFreeEnabled(row.dataset.id, e.target.checked); render(); }
+      return;
+    }
+    if (e.target.id === 'fReset') { clearFreeState(); toast('رجعت كل النماذج جاهزة'); render(); }
+    if (e.target.id === 'fTop') { setFreeOrder([]); toast('رجع ترتيبنا (الأقوى بالبرمجة أول)'); render(); }
+    if (e.target.id === 'fRefresh') {
+      try { await refreshOpenRouter({ force: true }); toast('تحدثت القائمة'); } catch (err) { toast(err.message); }
+      render();
+    }
+  });
 }
 
 /* ── الإعدادات ─────────────────────────────────────────── */
@@ -242,6 +298,12 @@ function settingsScreen() {
           ${seg('effort', [['low', 'خفيف'], ['medium', 'متوسط'], ['high', 'عالي'], ['xhigh', 'أقصى']], effort)}</label>
         <div class="row"><button class="btn sm" id="refresh">🔄 تحديث قائمة OpenRouter</button>
           <span class="muted" id="refst">${openRouterUpdatedAt() ? 'آخر تحديث ' + ago(openRouterUpdatedAt()) : 'لم تُحدَّث بعد'}</span></div>
+      </div>
+      <div class="card"><h3>🆓 النماذج المجانية</h3>
+        <p class="muted">النماذج المجانية من OpenRouter بالترتيب اللي تختاره: إذا واحد انشغل أو وصل حده أو انحذف، التطبيق يتحول للي بعده تلقائيًا.</p>
+        <p class="muted" id="freeSum"></p>
+        <div class="row"><button class="btn sm" id="freeList">⚙️ الأسماء والترتيب</button>
+          <button class="btn sm primary" id="freeUse">استخدم المجانية للصنع والتطوير</button></div>
       </div>
       <div class="card"><h3>📜 تعليمات النموذج (البرومبت)</h3>
         <p class="muted">انت تختار: تعليماتنا الجاهزة لصنع الألعاب، أو تضيف عليها، أو تكتب تعليماتك انت بالكامل. صيغة الرد تنضاف دائمًا لأن التطبيق يحتاجها حتى يقرأ الكود.</p>
@@ -294,6 +356,15 @@ function settingsScreen() {
   document.addEventListener('visibilitychange', () => { if (!document.hidden && $('#bgst')) bgState(); });
   $('#autofix').onchange = (e) => settings.set('autofix', e.target.checked);
   $('#back').onclick = () => history.back();
+  $('#freeSum').textContent = freeSummary();
+  $('#freeList').onclick = () => freeSheet(settingsScreen);
+  $('#freeUse').onclick = () => {
+    if (!keys.openrouter) return toast('يحتاج مفتاح OpenRouter');
+    setModelFor('build', FREE_MODEL);
+    setModelFor('auto', FREE_MODEL);
+    toast('صار الصنع والتطوير بالنماذج المجانية');
+    settingsScreen();
+  };
   $('#pb').onclick = () => pickModel('build', settingsScreen);
   $('#pa').onclick = () => pickModel('auto', settingsScreen);
   $$('[data-eye]').forEach((x) => (x.onclick = () => { const i = $('#' + x.dataset.eye); i.type = i.type === 'password' ? 'text' : 'password'; }));

@@ -160,7 +160,43 @@ const OR_MODELS = { data: [
   { id: 'google/gemini-3-pro-image', name: 'image model', created: Date.now() / 1000, context_length: 1000000,
     pricing: { prompt: '0.000002', completion: '0.00001' }, architecture: { input_modalities: ['text'], output_modalities: ['image', 'text'] } },
   { id: 'some/tiny-model', name: 'tiny', created: Date.now() / 1000, context_length: 8000, pricing: { prompt: '0', completion: '0' }, architecture: {} },
+  // نماذج مجانية: اثنان من عائلات قوية، واحد عادي، وواحد سياقه قصير وواحد للصور (يُستبعدان)
+  { id: 'qwen/qwen3-coder:free', name: 'Qwen: Qwen3 Coder (free)', created: Date.now() / 1000 - 86400 * 90, context_length: 262144,
+    pricing: { prompt: '0', completion: '0' }, architecture: { input_modalities: ['text'], output_modalities: ['text'] } },
+  { id: 'deepseek/deepseek-chat-v3.1:free', name: 'DeepSeek: DeepSeek V3.1 (free)', created: Date.now() / 1000 - 86400 * 60, context_length: 163840,
+    pricing: { prompt: '0', completion: '0' }, architecture: { input_modalities: ['text'], output_modalities: ['text'] } },
+  { id: 'meta-llama/llama-3.3-70b-instruct:free', name: 'Meta: Llama 3.3 70B Instruct (free)', created: Date.now() / 1000 - 86400 * 300, context_length: 131072,
+    pricing: { prompt: '0', completion: '0' }, architecture: { input_modalities: ['text'], output_modalities: ['text'] } },
+  { id: 'tiny/free-small:free', name: 'Tiny free', created: Date.now() / 1000, context_length: 4096,
+    pricing: { prompt: '0', completion: '0' }, architecture: { input_modalities: ['text'], output_modalities: ['text'] } },
+  { id: 'google/gemini-2.5-flash-image:free', name: 'image free', created: Date.now() / 1000, context_length: 32768,
+    pricing: { prompt: '0', completion: '0' }, architecture: { input_modalities: ['text'], output_modalities: ['image', 'text'] } },
 ] };
+
+// لعبة لاختبار سلسلة المجانية
+const GAME_FREE = `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body><canvas id="c"></canvas><script>
+/* FREEGAME */
+const c = document.getElementById('c'), x = c.getContext('2d'); c.width = 300; c.height = 300;
+function loop() {
+x.fillStyle = '#505';
+  x.fillRect(0, 0, 300, 300); requestAnimationFrame(loop);
+}
+loop();
+</script></body></html>`;
+let freeMode = 'ok';
+function freeReply(route, body) {
+  bump('free:' + body.model);
+  if (freeMode === 'daily') {
+    return route.fulfill({ status: 429, json: { error: { code: 429, message: 'Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day' } } });
+  }
+  if (body.model === 'qwen/qwen3-coder:free') {
+    return route.fulfill({ status: 429, json: { error: { code: 429, message: 'Provider returned error', metadata: { raw: 'qwen/qwen3-coder:free is temporarily rate-limited upstream' } } } });
+  }
+  const user = JSON.stringify(body.messages);
+  const [from, to] = user.includes("x.fillStyle = '#505';") ? ['#505', '#055'] : ['#055', '#550'];
+  const text = `<summary>عدلت اللون بـ ${body.model}.</summary><edit>\n<<<<<<< SEARCH\nx.fillStyle = '${from}';\n=======\nx.fillStyle = '${to}';\n>>>>>>> REPLACE\n</edit>`;
+  return route.fulfill({ status: 200, headers: { 'content-type': 'text/event-stream' }, body: orStream(text) });
+}
 
 function orStream(text) {
   const chunks = text.match(/[\s\S]{1,60}/g);
@@ -197,6 +233,7 @@ await page.route('https://openrouter.ai/**', async (route) => {
   if (url.endsWith('/credits')) return route.fulfill({ json: { data: { total_credits: 10, total_usage: 2.5 } } });
   const body = route.request().postDataJSON();
   calls.push({ provider: 'openrouter', body });
+  if (JSON.stringify(body.messages).includes('FREEGAME')) return freeReply(route, body);
   const text = `<summary>غيرت اللون (جولة تلقائية).</summary><roadmap>- [x] حلقة اللعب\n- [x] أعداء\n- [ ] نقاط</roadmap><edit>\n<<<<<<< SEARCH\n  x.fillStyle = '#234'; x.fillRect(0, 0, c.width, c.height);\n=======\n  x.fillStyle = '#315'; x.fillRect(0, 0, c.width, c.height);\n>>>>>>> REPLACE\n</edit>`;
   await route.fulfill({ status: 200, headers: { 'content-type': 'text/event-stream' }, body: orStream(text) });
 });
@@ -371,6 +408,70 @@ check(deepText.includes('WebGL inside the game frame') && deepText.includes('use
   'تقرير الخطأ فيه: هل WebGL يعمل، تلميح «استُخدم قبل إنشائه»، ومسار الاستدعاء');
 await page.waitForTimeout(2500);
 check(await page.isHidden('#errs'), 'اللعبة بعد المراجعة الكاملة تعمل بلا أخطاء');
+
+// ── النماذج المجانية: الأسماء، التبديل التلقائي، الحد اليومي، الترتيب ──
+await page.click('#back');
+await page.click('#set');
+await page.click('#refresh');
+await page.waitForFunction(() => document.querySelector('#refst').textContent.includes('✅'));
+await page.click('#freeUse');
+await page.waitForSelector('#freeList');
+await page.click('#freeList');
+await page.waitForSelector('.sheet [data-id]');
+const freeNames = await page.$$eval('.sheet [data-id]', (rows) => rows.map((r) => r.dataset.id));
+check(freeNames.join(',') === 'qwen/qwen3-coder:free,deepseek/deepseek-chat-v3.1:free,meta-llama/llama-3.3-70b-instruct:free',
+  'قائمة المجانية: الأسماء مرتبة بالأقوى بالبرمجة، واستبعاد السياق القصير ونماذج الصور → ' + freeNames.join(', '));
+await page.screenshot({ path: join(OUT, '11-free.png') });
+await page.click('.sheet [data-close]');
+await page.click('#back');
+await page.setInputFiles('#imp', { name: 'freegame.html', mimeType: 'text/html', buffer: Buffer.from(GAME_FREE) });
+await page.waitForSelector('#req');
+check((await page.textContent('#tab')).includes('النماذج المجانية'), 'شاشة اللعبة تعرض أن الطلبات بالنماذج المجانية');
+await page.fill('#req', 'غيّر اللون');
+await page.click('#send');
+await page.waitForFunction(() => document.querySelector('#busy')?.hidden && document.querySelector('#chat')?.textContent.includes('عدلت اللون'), null, { timeout: 60000 });
+let chatText = await page.textContent('#chat');
+check(count['free:qwen/qwen3-coder:free'] === 1 && count['free:deepseek/deepseek-chat-v3.1:free'] === 1 && chatText.includes('حولت على DeepSeek V3.1'),
+  'نموذج مجاني مشغول (429) ← تحول تلقائيًا للتالي ونجح، والمحادثة تبين الأسماء');
+const freeCalls = calls.filter((c) => c.provider === 'openrouter' && String(c.body.model).endsWith(':free'));
+check(freeCalls.length >= 2 && freeCalls.every((c) => !c.body.models), 'المجاني لا يتحول أبدًا لنموذج مدفوع (لا openrouter/auto)');
+
+freeMode = 'daily';
+const before = { ...count };
+await page.fill('#req', 'غيّر اللون مرة ثانية');
+await page.click('#send');
+await page.waitForFunction(() => document.querySelector('#busy')?.hidden && document.querySelector('#chat')?.textContent.includes('خلصت طلباتك المجانية لليوم'), null, { timeout: 60000 });
+const tried = Object.keys(count).filter((k) => k.startsWith('free:') && count[k] !== before[k]);
+check(tried.length === 1 && !tried[0].includes('llama'), 'الحد اليومي للحساب: وقف وشرح السبب بدل ما يلف على كل النماذج بلا فايدة');
+
+// ترتيبك: Llama أول، وتعطيل Qwen
+freeMode = 'ok';
+await page.click('#back');
+await page.click('#set');
+await page.click('#freeList');
+await page.waitForSelector('.sheet [data-id]');
+await page.click('#fReset');
+await page.click('.sheet [data-id="meta-llama/llama-3.3-70b-instruct:free"] [data-up]');
+await page.click('.sheet [data-id="meta-llama/llama-3.3-70b-instruct:free"] [data-up]');
+await page.click('.sheet [data-id="qwen/qwen3-coder:free"] [data-on]');
+const order = await page.$$eval('.sheet [data-id]', (rows) => rows.map((r) => r.dataset.id + (r.querySelector('[data-on]').checked ? '' : '(off)')));
+check(order[0].startsWith('meta-llama') && order.some((o) => o === 'qwen/qwen3-coder:free(off)'), 'تبديل الترتيب والتعطيل يدويًا → ' + order.join(', '));
+await page.click('.sheet [data-close]');
+await page.click('#back');
+await page.click('.game:has-text("freegame")');
+await page.waitForSelector('#req');
+const llamaBefore = count['free:meta-llama/llama-3.3-70b-instruct:free'] || 0, qwenBefore = count['free:qwen/qwen3-coder:free'];
+await page.fill('#req', 'غيّر اللون مرة ثالثة');
+await page.click('#send');
+await page.waitForFunction(() => document.querySelector('#busy')?.hidden && document.querySelector('#chat')?.textContent.includes('meta-llama'), null, { timeout: 60000 });
+check(count['free:meta-llama/llama-3.3-70b-instruct:free'] === llamaBefore + 1 && count['free:qwen/qwen3-coder:free'] === qwenBefore,
+  'الطلب راح لأول نموذج بترتيبك (Llama)، والمعطّل (Qwen) ما انطلب');
+await page.click('#back');
+await page.click('#set');
+await page.click('#pb');
+await page.click('.sheet .opt[data-id="claude-opus-5-5"]');
+await page.click('#pa');
+await page.click('.sheet .opt[data-id="qwen/qwen3-coder-plus"]');
 await page.click('#back');
 await page.click('.game:has-text("نجمة الفضاء")');
 await page.waitForSelector('#game');

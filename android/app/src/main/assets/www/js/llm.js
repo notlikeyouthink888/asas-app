@@ -2,7 +2,9 @@
 // كلاهما بالبث (streaming) حتى يظهر التقدم ولا تنقطع الطلبات الطويلة.
 
 import { keys } from './store.js';
-import { costOf } from './models.js';
+import {
+  costOf, FREE_CHAIN, freeChain, freeState, markFree, countFree, freeDailyBlocked, blockFreeDaily,
+} from './models.js';
 
 export class StopError extends Error {
   constructor() { super('أُوقفت العملية'); this.stop = true; }
@@ -43,11 +45,14 @@ const ATTEMPTS = 6;
  * إن انقطع الاتصال أو انشغل الخادم ينتظر ويعيد المحاولة حتى 6 مرات (onRetry يُبلغ الواجهة).
  */
 export async function complete(opts) {
+  if (opts.model.id === FREE_CHAIN) return freeComplete(opts);
   for (let attempt = 1; ; attempt++) {
     try {
       return opts.model.provider === 'anthropic' ? await claude(opts) : await openRouter(opts);
     } catch (e) {
       if (e.stop || !e.retryable) throw e;
+      // ضمن سلسلة المجانية: نموذج مشغول أو وصل حده ← نتحول للتالي فورًا بدل الانتظار
+      if (opts.switchOnLimit && (e.limit || e.unavailable)) throw e;
       if (attempt >= ATTEMPTS) throw Object.assign(new Error('تعذر الاتصال بعد عدة محاولات: ' + e.message), { network: true });
       opts.onRetry?.(attempt, ATTEMPTS - 1, e.message);
       await online(opts.signal);
@@ -143,6 +148,57 @@ export async function claudeModels() {
   return ids;
 }
 
+/* ── سلسلة النماذج المجانية ──────────────────────────────── */
+
+const MIN = 60e3;
+
+function untilText(t) {
+  return new Date(t).toLocaleTimeString('ar-IQ', { hour: 'numeric', minute: '2-digit' });
+}
+
+function dailyError() {
+  return new Error(`خلصت طلباتك المجانية لليوم. هذا حد OpenRouter للحساب كله (كل النماذج المجانية سوا): 50 طلب باليوم،
+أو 1000 إذا الحساب شحن 10$ أو أكثر ولو مرة. يتجدد الساعة ${untilText(blockFreeDailyUntil())} (منتصف الليل بتوقيت UTC).
+لحد ذاك الوقت اختر نموذجًا مدفوعًا من «تغيير».`);
+}
+function blockFreeDailyUntil() { return freeDailyBlocked() || Date.now(); }
+
+/**
+ * يجرب النماذج المجانية بالترتيب: مشغول أو وصل حده (429) ← يوقفه 3 دقائق ويتحول للتالي؛
+ * غير متوفر أو محجوب بإعدادات الخصوصية ← يوقفه يومًا ويتحول؛ الحد اليومي للحساب ← يوقف الكل ويشرح السبب.
+ */
+async function freeComplete(opts) {
+  if (freeDailyBlocked()) throw dailyError();
+  const chain = freeChain();
+  if (!chain.length) throw new Error('ماكو نماذج مجانية مفعّلة. فعّلها من الإعدادات ← النماذج المجانية.');
+  const usable = chain.filter((m) => !freeState(m.id));
+  if (!usable.length) {
+    const soon = Math.min(...chain.map((m) => freeState(m.id).until));
+    throw new Error(`كل النماذج المجانية مشغولة أو موقوفة الآن. أقرب واحد يرجع الساعة ${untilText(soon)}. جرّب بعدها أو اختر نموذجًا مدفوعًا.`);
+  }
+  let policy = false;
+  for (let i = 0; i < usable.length; i++) {
+    const m = usable[i];
+    opts.onModel?.(m);
+    try {
+      const r = await complete({ ...opts, model: m, switchOnLimit: true });
+      countFree(m.id);
+      return { ...r, cost: 0, servedBy: m };
+    } catch (e) {
+      if (e.stop || e.network) throw e;
+      if (e.daily) { blockFreeDaily(); throw dailyError(); }
+      if (!e.limit && !e.unavailable) throw e;
+      policy ||= !!e.policy;
+      const why = e.policy ? 'محجوب بإعدادات الخصوصية' : e.unavailable ? 'غير متوفر حاليًا' : 'مشغول أو وصل حده';
+      markFree(m.id, e.unavailable ? 24 * 60 * MIN : 3 * MIN, why);
+      opts.onSwitch?.(m, usable[i + 1] || null, why);
+    }
+  }
+  throw new Error(policy
+    ? 'النماذج المجانية محجوبة بإعدادات الخصوصية في حسابك. فعّل «Free model publication / training» من openrouter.ai/settings/privacy ثم جرّب.'
+    : 'كل النماذج المجانية مشغولة أو وصلت حدها الآن. جرّب بعد دقائق أو اختر نموذجًا مدفوعًا.');
+}
+
 /* ── OpenRouter ─────────────────────────────────────────── */
 
 const OR = 'https://openrouter.ai/api/v1';
@@ -160,13 +216,32 @@ function orHeaders() {
 
 async function orError(res) {
   let msg = '';
-  try { msg = (await res.json()).error?.message || ''; } catch { /* نص غير JSON */ }
-  switch (res.status) {
+  try {
+    const e = (await res.json()).error || {};
+    msg = [e.message, e.metadata?.raw].filter(Boolean).join(' — ');
+  } catch { /* نص غير JSON */ }
+  return orClassify(res.status, msg);
+}
+
+/** يصنف أخطاء OpenRouter: حد يومي للحساب، حد بالدقيقة، نموذج مشغول، نموذج غير متوفر... */
+function orClassify(status, msg) {
+  // حد OpenRouter اليومي للمجانية: للحساب كله وليس لكل نموذج، فالتبديل لا يفيد
+  if (/free-models-per-day/i.test(msg)) return Object.assign(new Error(msg), { daily: true });
+  // حد الدقيقة للحساب كله: ننتظر دقيقة ونعيد
+  if (/free-models-per-min/i.test(msg)) return Object.assign(temporary('حد الطلبات بالدقيقة للمجانية'), { slow: true });
+  if (/data policy|privacy/i.test(msg)) return Object.assign(new Error(msg), { unavailable: true, policy: true });
+  switch (status) {
     case 401: return new Error('مفتاح OpenRouter غير صحيح (401).');
     case 402: return new Error('رصيد محفظة OpenRouter لا يكفي (402). اشحنها أو اختر نموذجًا أرخص.');
-    case 429: return Object.assign(temporary('طلبات كثيرة (429)'), { slow: true });
-    case 408: case 500: case 502: case 503: case 504: return temporary(`خادم OpenRouter مشغول (${res.status}) ${msg}`);
-    default: return new Error(`خطأ OpenRouter ${res.status}: ${msg}`);
+    // 429 هنا غالبًا من مزود النموذج نفسه (مشغول): التبديل لنموذج آخر يحلها
+    case 429: return Object.assign(temporary(`النموذج مشغول (429) ${msg}`), { slow: true, limit: true });
+    case 404: return Object.assign(new Error(`النموذج غير متوفر (404) ${msg}`), { unavailable: true });
+    case 400: return /not a valid model|model.*not (found|exist|available)|no endpoints/i.test(msg)
+      ? Object.assign(new Error(`النموذج غير متوفر: ${msg}`), { unavailable: true })
+      : new Error(`خطأ OpenRouter 400: ${msg}`);
+    case 408: case 500: case 502: case 503: case 504:
+      return Object.assign(temporary(`خادم النموذج مشغول (${status}) ${msg}`), { limit: true });
+    default: return new Error(`خطأ OpenRouter ${status}: ${msg}`);
   }
 }
 
@@ -184,8 +259,9 @@ async function openRouter({ model, system, parts, maxTokens, signal, onText, onT
     max_tokens: Math.min(maxTokens || 64000, model.maxOut || 32000),
     usage: { include: true },
   };
-  // بديل تلقائي إن تعطل النموذج المختار
-  if (model.id !== 'openrouter/auto') body.models = [model.id, 'openrouter/auto'];
+  // بديل تلقائي إن تعطل النموذج المختار — لكن ليس للمجاني: openrouter/auto مدفوع وسيصرف من محفظتك
+  const free = model.free || model.id.endsWith(':free');
+  if (!free && model.id !== 'openrouter/auto') body.models = [model.id, 'openrouter/auto'];
 
   let res;
   try {
@@ -213,8 +289,11 @@ async function openRouter({ model, system, parts, maxTokens, signal, onText, onT
         if (data === '[DONE]') continue;
         let j;
         try { j = JSON.parse(data); } catch { continue; }
-        // خطأ من المزود أثناء البث (غالبًا مؤقت): يُعاد الطلب
-        if (j.error) throw temporary('OpenRouter: ' + (j.error.message || 'خطأ أثناء البث'));
+        // خطأ من المزود أثناء البث (غالبًا مؤقت أو حد): يُعاد الطلب أو يُبدَّل النموذج
+        if (j.error) {
+          const err = orClassify(Number(j.error.code) || 502, String(j.error.message || 'خطأ أثناء البث'));
+          throw err.daily || err.unavailable || err.limit ? err : Object.assign(temporary('OpenRouter: ' + err.message), { limit: true });
+        }
         if (j.model) served = j.model;
         const ch = j.choices?.[0];
         const d = ch?.delta;

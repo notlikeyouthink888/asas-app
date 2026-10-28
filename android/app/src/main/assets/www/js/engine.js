@@ -322,6 +322,8 @@ async function call(ctx, project, parts, label, { effort } = {}) {
     model: ctx.model, system: systemPrompt(), parts, effort: effort || ctx.effort, signal: ctx.signal,
     onText: ctx.ui.text, onThinking: ctx.ui.thinking,
     onRetry: (n, max, why) => { ctx.ui.retry?.(n, max, why); ctx.ui.phase?.(`${label} (إعادة الاتصال ${n}/${max})`); },
+    onModel: (m) => ctx.ui.model?.(m),
+    onSwitch: (from, to, why) => ctx.ui.switch?.(from, to, why),
   });
   ctx.spent = (ctx.spent || 0) + r.cost;
   project.spent = (project.spent || 0) + r.cost;

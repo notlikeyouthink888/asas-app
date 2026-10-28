@@ -61,7 +61,6 @@ function perM(v) {
 export function rankOpenRouter(list) {
   const now = Date.now() / 1000;
   const picked = new Map();
-  const free = [];
   for (const m of list || []) {
     const id = String(m.id || '');
     const outMods = m.architecture?.output_modalities || ['text'];
@@ -83,7 +82,7 @@ export function rankOpenRouter(list) {
       created: m.created || 0,
       score: FAMILIES[fam].w + recency,
     };
-    if (id.endsWith(':free')) { free.push(entry); continue; }
+    if (id.endsWith(':free')) continue;
     const prev = picked.get(fam);
     if (!prev || entry.created > prev.created) picked.set(fam, entry);
   }
@@ -93,10 +92,119 @@ export function rankOpenRouter(list) {
   // أقوى نموذج متوسط السعر يصعد للفئة الأولى إن كانت فارغة
   if (!all.some((m) => m.tier === 'best') && all[0]) all[0].tier = 'best';
   if (all[0]) all[0].recommended = true;
-  free.sort((a, b) => b.score - a.score);
-  for (const m of free.slice(0, 3)) all.push({ ...m, tier: 'free', note: 'مجاني لكن بحدود طلبات منخفضة' });
   return all;
 }
+
+/* ── النماذج المجانية ───────────────────────────────────── */
+
+/** معرّف «سلسلة المجانية»: التطبيق يجرب المجانية بالترتيب ويتحول للتالي إن انشغل أحدها أو وصل حده أو اختفى. */
+export const FREE_CHAIN = 'free/chain';
+
+/** احتياط إن تعذر جلب القائمة الحية (الأسماء تتغير؛ غير الموجود يُتخطى تلقائيًا). */
+const FREE_FALLBACK = [
+  ['qwen/qwen3-coder:free', 'Qwen3 Coder', 262144],
+  ['deepseek/deepseek-chat-v3.1:free', 'DeepSeek V3.1', 163840],
+  ['moonshotai/kimi-k2:free', 'Kimi K2', 32768],
+  ['z-ai/glm-4.5-air:free', 'GLM 4.5 Air', 131072],
+  ['openai/gpt-oss-120b:free', 'GPT-OSS 120B', 131072],
+  ['deepseek/deepseek-r1-0528:free', 'DeepSeek R1', 163840],
+  ['tngtech/deepseek-r1t2-chimera:free', 'DeepSeek R1T2 Chimera', 163840],
+  ['meta-llama/llama-3.3-70b-instruct:free', 'Llama 3.3 70B', 131072],
+  ['google/gemma-3-27b-it:free', 'Gemma 3 27B', 131072],
+  ['mistralai/mistral-small-3.2-24b-instruct:free', 'Mistral Small 3.2', 131072],
+].map(([id, name, ctx]) => ({ provider: 'openrouter', id, name, ctx, in: 0, out: 0, free: true, vision: false }));
+
+/** كل النماذج المجانية من القائمة الحية، مرتبة بالقوة في البرمجة ثم الحداثة وطول السياق. */
+export function rankFree(list) {
+  const now = Date.now() / 1000;
+  const out = [];
+  for (const m of list || []) {
+    const id = String(m.id || '');
+    const zero = Number(m.pricing?.prompt) === 0 && Number(m.pricing?.completion) === 0;
+    if (!(id.endsWith(':free') || zero) || id.startsWith('openrouter/')) continue;
+    const outMods = m.architecture?.output_modalities || ['text'];
+    if (!outMods.includes('text') || BAD.test(id)) continue;
+    const ctx = m.context_length || m.top_provider?.context_length || 0;
+    if (ctx < 16000) continue;
+    const fam = FAMILIES.findIndex((f) => f.re.test(id.replace(/:free$/, '')));
+    const ageDays = m.created ? (now - m.created) / 86400 : 365;
+    out.push({
+      provider: 'openrouter', id, name: (m.name || id).replace(/^[^:]+:\s*/, '').replace(/\s*\(free\)\s*$/i, ''),
+      in: 0, out: 0, ctx, free: true,
+      vision: (m.architecture?.input_modalities || []).includes('image'),
+      maxOut: m.top_provider?.max_completion_tokens || null,
+      score: (fam >= 0 ? FAMILIES[fam].w : 55) + Math.max(0, 12 - ageDays / 30) + Math.min(8, ctx / 32768),
+    });
+  }
+  return out.sort((a, b) => b.score - a.score);
+}
+
+export function freeModels() {
+  const c = settings.get(CACHE_KEY);
+  return c?.free?.length ? c.free : FREE_FALLBACK;
+}
+
+/** السلسلة حسب ترتيبك (المحفوظ أولًا، والجديد بعده بترتيبنا)، بدون اللي عطلتها. */
+export function freeChain({ includeDisabled = false } = {}) {
+  const all = freeModels();
+  const order = settings.get('free.order') || [];
+  const off = new Set(settings.get('free.off') || []);
+  const pos = (id) => { const i = order.indexOf(id); return i < 0 ? 1e6 + all.findIndex((m) => m.id === id) : i; };
+  return [...all].sort((a, b) => pos(a.id) - pos(b.id)).filter((m) => includeDisabled || !off.has(m.id));
+}
+
+export function setFreeOrder(ids) { settings.set('free.order', ids); }
+export function setFreeEnabled(id, on) {
+  const off = new Set(settings.get('free.off') || []);
+  if (on) off.delete(id); else off.add(id);
+  settings.set('free.off', [...off]);
+}
+export function isFreeEnabled(id) { return !(settings.get('free.off') || []).includes(id); }
+
+/** بداية اليوم التالي بتوقيت UTC (يتجدد فيه الحد اليومي للمجانية في OpenRouter). */
+export function nextUtcDay() {
+  const d = new Date();
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1);
+}
+
+/** حالة كل نموذج مجاني: موقوف مؤقتًا حتى وقت معين ولماذا. */
+export function freeState(id) {
+  const st = (settings.get('free.state') || {})[id];
+  return st && st.until > Date.now() ? st : null;
+}
+export function markFree(id, ms, why) {
+  const all = settings.get('free.state') || {};
+  all[id] = { until: Date.now() + ms, why };
+  settings.set('free.state', all);
+}
+export function clearFreeState() { settings.set('free.state', null); settings.set('free.dailyUntil', null); }
+
+/** حد OpenRouter اليومي للحساب كله (كل المجانية معًا). */
+export function freeDailyBlocked() {
+  const u = settings.get('free.dailyUntil');
+  return u && u > Date.now() ? u : 0;
+}
+export function blockFreeDaily() { settings.set('free.dailyUntil', nextUtcDay()); }
+
+/** عداد طلبات اليوم المجانية (تقريبي، من هذا التطبيق فقط). */
+export function freeUsage() {
+  const day = new Date().toISOString().slice(0, 10);
+  const u = settings.get('free.usage');
+  return u?.day === day ? u : { day, total: 0, per: {} };
+}
+export function countFree(id) {
+  const u = freeUsage();
+  u.total++;
+  u.per[id] = (u.per[id] || 0) + 1;
+  settings.set('free.usage', u);
+}
+
+export const FREE_MODEL = {
+  provider: 'openrouter', id: FREE_CHAIN, name: '🆓 النماذج المجانية (تبديل تلقائي)', in: 0, out: 0, free: true,
+  // الصور تُرسل فقط للنموذج المجاني الذي يدعمها (llm.js يحذفها لغيره)
+  vision: true,
+  note: 'يجرب المجانية بالترتيب اللي تختاره، وإذا انشغل واحد أو وصل حده أو انحذف يتحول للتالي تلقائيًا.',
+};
 
 const CACHE_KEY = 'models.openrouter';
 
@@ -117,16 +225,18 @@ export async function refreshOpenRouter({ force = false } = {}) {
   if (!res.ok) throw new Error('تعذر جلب قائمة النماذج: ' + res.status);
   const data = await res.json();
   const list = rankOpenRouter(data.data);
-  if (list.length) settings.set(CACHE_KEY, { at: Date.now(), list });
+  const free = rankFree(data.data);
+  if (list.length || free.length) settings.set(CACHE_KEY, { at: Date.now(), list: list.length ? list : openRouterModels(), free });
   return list;
 }
 
 export function allModels() {
-  return [...CLAUDE_MODELS, ...openRouterModels()];
+  return [...CLAUDE_MODELS, ...openRouterModels(), ...freeModels()];
 }
 
 export function findModel(ref) {
   if (!ref) return null;
+  if (ref.id === FREE_CHAIN) return FREE_MODEL;
   return allModels().find((m) => m.provider === ref.provider && m.id === ref.id)
     || (ref.provider === 'openrouter' ? { provider: 'openrouter', id: ref.id, name: ref.id, in: 0, out: 0, vision: false } : null);
 }
@@ -155,7 +265,6 @@ export const TIERS = [
   { id: 'best', label: '⭐ الأقوى للتطوير' },
   { id: 'balanced', label: '⚖️ متوازن' },
   { id: 'cheap', label: '💰 اقتصادي' },
-  { id: 'free', label: '🆓 مجاني' },
 ];
 
 /** التكلفة بالدولار من عدد الرموز. */

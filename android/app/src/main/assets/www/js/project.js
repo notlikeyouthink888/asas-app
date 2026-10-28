@@ -334,7 +334,7 @@ function devTab() {
 
 /* ── تشغيل العمليات ────────────────────────────────────── */
 
-let streamBuf = '', thinkBuf = '', streamLines = 0, drawQueued = false;
+let streamBuf = '', thinkBuf = '', streamLines = 0, drawQueued = false, lastFree = null;
 function draw() {
   drawQueued = false;
   const s = $('#stream'), t = $('#think'), l = $('#lines');
@@ -366,6 +366,14 @@ function uiCallbacks() {
       queueDraw();
     },
     retry: (n, max) => { const l = $('#log'); if (l) l.insertAdjacentHTML('beforeend', `<div>📶 انقطع الاتصال، أنتظر وأعيد المحاولة (${n}/${max})…</div>`); },
+    // سلسلة المجانية: أي نموذج يشتغل الآن، ومتى تحول لغيره
+    model: (m) => {
+      if (lastFree === m.id) return;
+      lastFree = m.id;
+      const l = $('#log');
+      if (l) l.insertAdjacentHTML('beforeend', `<div>🆓 يشتغل الآن: ${esc(m.name)}</div>`);
+    },
+    switch: (from, to, why) => addChat('sys', `🔁 ${from.name}: ${why}${to ? `، حولت على ${to.name}` : ''}`),
     thinking: (d) => { thinkBuf += d; if (thinkBuf.length > 1000) thinkBuf = thinkBuf.slice(-400); queueDraw(); },
     spent: (now) => { const c = $('#cost'); if (c) c.textContent = `صُرف الآن ${money(now)} · كل اللعبة ${money(P?.spent)}`; },
     log: (t) => { const l = $('#log'); if (l) l.insertAdjacentHTML('beforeend', `<div>${esc(t)}</div>`); addChat('sys', t); },
