@@ -40,6 +40,7 @@ const DEFAULT_CONFIG = {
   open: true,                  // يقبل أجهزة جديدة
   lock: false,                 // يمنع المستخدمين من التحويل إلى مفاتيحهم
   notice: '',                  // رسالة تظهر للمستخدمين في التطبيق
+  publicTypes: ['theory'],     // أنواع التقارير المتاحة للمستخدمين العاديين (الباقي للمدير فقط)
   telegram: { token: '', chat: '' },
   notify: { reports: true, keys: true, users: true },
 };
@@ -349,6 +350,7 @@ async function publicConfig(req, env) {
     usedToday: used,
     lock: !!cfg.lock,
     notice: cfg.notice || '',
+    publicTypes: Array.isArray(cfg.publicTypes) ? cfg.publicTypes : ['theory'],
     ready: keys > 0,
   });
 }
@@ -447,6 +449,7 @@ async function admin(req, env, ctx, path) {
     if (Number.isFinite(body.dailyLimit)) next.dailyLimit = Math.max(0, Math.min(1000, Math.round(body.dailyLimit)));
     ['open', 'lock'].forEach((k) => { if (typeof body[k] === 'boolean') next[k] = body[k]; });
     if (typeof body.notice === 'string') next.notice = clip(body.notice, 500);
+    if (Array.isArray(body.publicTypes)) next.publicTypes = [...new Set(body.publicTypes.filter((x) => typeof x === 'string').map((x) => clip(x, 30)))].slice(0, 20);
     if (body.telegram) {
       next.telegram = { ...cfg.telegram };
       if (typeof body.telegram.chat === 'string') next.telegram.chat = clip(body.telegram.chat.trim(), 40);
@@ -519,6 +522,7 @@ async function admin(req, env, ctx, path) {
     if (m === 'PATCH') {
       const id = decodeURIComponent(seg[2] || '');
       if (typeof body.blocked === 'boolean') await q(env, 'UPDATE devices SET blocked = ? WHERE id = ?', body.blocked ? 1 : 0, id).run();
+      if (typeof body.name === 'string') await q(env, 'UPDATE devices SET name = ? WHERE id = ?', clip(body.name.trim(), 80), id).run();
       return json({ ok: true });
     }
   }
