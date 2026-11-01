@@ -59,6 +59,11 @@ const SCHEMA = [
   'CREATE INDEX IF NOT EXISTS ev_dev ON events(device, kind, ts)',
   'CREATE INDEX IF NOT EXISTS rp_ts ON reports(ts)',
 ];
+// أعمدة أُضيفت لاحقًا: تُضاف للقواعد القديمة، ويُتجاهل خطأ «العمود موجود»
+const MIGRATIONS = [
+  'ALTER TABLE devices ADD COLUMN key_id INTEGER DEFAULT 0', // مفتاح خاص يعيّنه المدير لهذا المستخدم
+  'ALTER TABLE devices ADD COLUMN named INTEGER DEFAULT 0',  // المدير غيّر الاسم: لا يكتبه التطبيق فوقه
+];
 
 const CORS = {
   'access-control-allow-origin': '*',
@@ -86,7 +91,9 @@ const dec = (s) => { try { return decodeURIComponent(s || ''); } catch { return 
 let ready = null;
 function init(env) {
   if (!env.DB) throw new Error('NO_DB');
-  ready ||= env.DB.batch(SCHEMA.map((s) => env.DB.prepare(s))).catch((e) => { ready = null; throw e; });
+  ready ||= env.DB.batch(SCHEMA.map((s) => env.DB.prepare(s)))
+    .then(() => Promise.all(MIGRATIONS.map((s) => env.DB.prepare(s).run().catch(() => {}))))
+    .catch((e) => { ready = null; throw e; });
   return ready;
 }
 const q = (env, sql, ...args) => env.DB.prepare(sql).bind(...args);
@@ -152,8 +159,10 @@ function untilFor(verdict) {
   return 9e15; // مرفوض: حتى يعيد المدير تفعيله
 }
 
-async function pickKey(env, provider, tried) {
-  const { results } = await q(env, 'SELECT * FROM keys WHERE provider = ? AND enabled = 1 AND until <= ? ORDER BY id', provider, now()).all();
+/** مفتاح المستخدم الخاص (إن عيّنه المدير) أولًا، ثم المفاتيح المشتركة. مفتاح مستخدم آخر لا يُستعمل لغيره. */
+async function pickKey(env, provider, tried, own = 0) {
+  const { results } = await q(env, `SELECT * FROM keys WHERE provider = ? AND enabled = 1 AND until <= ?
+    AND (id = ? OR id NOT IN (SELECT key_id FROM devices WHERE key_id > 0)) ORDER BY (id = ?) DESC, id`, provider, now(), own, own).all();
   return results.find((k) => !tried.has(k.id)) || null;
 }
 
@@ -191,13 +200,14 @@ function metaOf(req) {
 async function admit(env, cfg, ctx, dev, meta, fmt) {
   const fail = fmt === 'anthropic' ? (s, m) => anErr(s, s === 429 ? 'rate_limit_error' : 'permission_error', m) : orErr;
   if (!dev.id) return fail(400, 'التطبيق قديم أو معطوب: حدّثه من المدير.');
-  const row = await q(env, 'SELECT blocked FROM devices WHERE id = ?', dev.id).first();
+  const row = await q(env, 'SELECT blocked, key_id FROM devices WHERE id = ?', dev.id).first();
+  dev.keyId = row?.key_id || 0;
   if (!row && !cfg.open) return fail(403, 'مدير التطبيق أغلق التسجيل لأجهزة جديدة حاليًا.');
   if (row?.blocked) return fail(403, 'أوقف مدير التطبيق هذا الجهاز. تواصل معه.');
   const t = now();
   await q(env, `INSERT INTO devices (id, name, first_seen, last_seen, requests, platform) VALUES (?, ?, ?, ?, 1, ?)
     ON CONFLICT(id) DO UPDATE SET last_seen = excluded.last_seen, requests = requests + 1,
-    name = CASE WHEN excluded.name <> '' THEN excluded.name ELSE name END`, dev.id, dev.name, t, t, dev.platform).run();
+    name = CASE WHEN excluded.name <> '' AND named = 0 THEN excluded.name ELSE name END`, dev.id, dev.name, t, t, dev.platform).run();
   if (!row && cfg.notify.users) ctx.waitUntil(telegram(env, cfg, `👤 مستخدم جديد: ${dev.name || 'بلا اسم'} (${dev.platform || 'جهاز'})`));
   // حماية من الإغراق: 40 طلبًا في الدقيقة للجهاز
   const burst = await q(env, 'SELECT COUNT(*) AS n FROM events WHERE device = ? AND ts > ?', dev.id, t - 60000).first();
@@ -256,7 +266,7 @@ async function proxyOpenRouter(req, env, ctx, path) {
   const base = env.OR_UPSTREAM || OR_BASE;
   const tried = new Set();
   for (;;) {
-    const key = await pickKey(env, 'openrouter', tried);
+    const key = await pickKey(env, 'openrouter', tried, dev.keyId);
     if (!key) {
       logEvent(env, ctx, dev, meta, models[0], null, 503, 0);
       if (cfg.notify.keys) ctx.waitUntil(telegram(env, cfg, '❌ كل مفاتيح OpenRouter انتهت حصتها أو تعطلت. أضف مفتاحًا جديدًا من لوحة المدير.'));
@@ -305,7 +315,7 @@ async function proxyAnthropic(req, env, ctx) {
   const base = env.ANTHROPIC_UPSTREAM || AN_BASE;
   const tried = new Set();
   for (;;) {
-    const key = await pickKey(env, 'anthropic', tried);
+    const key = await pickKey(env, 'anthropic', tried, dev.keyId);
     if (!key) {
       logEvent(env, ctx, dev, meta, body.model, null, 503, 0);
       if (cfg.notify.keys) ctx.waitUntil(telegram(env, cfg, '❌ كل مفاتيح Claude انتهى رصيدها أو تعطلت. أضف مفتاحًا من لوحة المدير.'));
@@ -417,6 +427,15 @@ const keyView = (k) => {
 
 const configView = (cfg) => ({ ...cfg, telegram: { chat: cfg.telegram.chat, token: mask(cfg.telegram.token), hasToken: !!cfg.telegram.token } });
 
+async function addKey(env, body) {
+  const provider = body.provider === 'anthropic' ? 'anthropic' : 'openrouter';
+  const secret = String(body.secret || '').replace(/[\s​-‏‪-‮⁠-⁩﻿]/g, '');
+  if (secret.length < 20) return { error: 'المفتاح قصير أو غير صحيح' };
+  const label = clip(String(body.label || '').trim(), 40) || `مفتاح ${mask(secret)}`;
+  const r = await q(env, 'INSERT INTO keys (label, provider, secret, created) VALUES (?, ?, ?, ?)', label, provider, secret, now()).run();
+  return { id: Number(r.meta?.last_row_id) || (await q(env, 'SELECT MAX(id) AS id FROM keys').first())?.id };
+}
+
 async function admin(req, env, ctx, path) {
   if (!env.ADMIN_PASSWORD) return json({ error: 'لم تُضبط كلمة سر المدير ADMIN_PASSWORD على الخادم' }, 500);
   if (!adminOk(req, env)) return json({ error: 'كلمة سر المدير غير صحيحة' }, 401);
@@ -428,14 +447,17 @@ async function admin(req, env, ctx, path) {
   if (path === '/admin/state' && m === 'GET') {
     const cfg = await getConfig(env);
     const t0 = dayStart();
-    const [keys, devices, today, total, reqs] = await Promise.all([
+    const [keys, devices, today, total, reqs, owners] = await Promise.all([
       q(env, 'SELECT * FROM keys ORDER BY id').all(),
       q(env, 'SELECT COUNT(*) AS n FROM devices').first(),
       q(env, 'SELECT COUNT(*) AS n FROM reports WHERE ts >= ? AND status = \'ready\'', t0).first(),
       q(env, 'SELECT COUNT(*) AS n FROM reports WHERE status = \'ready\'').first(),
       q(env, 'SELECT COUNT(*) AS n FROM events WHERE ts >= ?', t0).first(),
+      q(env, 'SELECT key_id, name FROM devices WHERE key_id > 0').all(),
     ]);
-    return json({ config: configView(cfg), keys: keys.results.map(keyView), stats: { devices: devices?.n || 0, reportsToday: today?.n || 0, reportsTotal: total?.n || 0, requestsToday: reqs?.n || 0 }, now: now() });
+    const ownerOf = {};
+    owners.results.forEach((d) => { (ownerOf[d.key_id] ||= []).push(d.name || 'بلا اسم'); });
+    return json({ config: configView(cfg), keys: keys.results.map((k) => ({ ...keyView(k), owners: ownerOf[k.id] || [] })), stats: { devices: devices?.n || 0, reportsToday: today?.n || 0, reportsTotal: total?.n || 0, requestsToday: reqs?.n || 0 }, now: now() });
   }
 
   if (path === '/admin/config' && m === 'PUT') {
@@ -467,12 +489,8 @@ async function admin(req, env, ctx, path) {
 
   if (seg[1] === 'keys') {
     if (seg.length === 2 && m === 'POST') {
-      const provider = body.provider === 'anthropic' ? 'anthropic' : 'openrouter';
-      const secret = String(body.secret || '').replace(/[\s​-‏‪-‮⁠-⁩﻿]/g, '');
-      if (secret.length < 20) return json({ error: 'المفتاح قصير أو غير صحيح' }, 400);
-      const label = clip(String(body.label || '').trim(), 40) || `مفتاح ${mask(secret)}`;
-      await q(env, 'INSERT INTO keys (label, provider, secret, created) VALUES (?, ?, ?, ?)', label, provider, secret, now()).run();
-      return json({ ok: true });
+      const r = await addKey(env, body);
+      return r.error ? json(r, 400) : json({ ok: true, id: r.id });
     }
     const id = Number(seg[2]);
     const key = await q(env, 'SELECT * FROM keys WHERE id = ?', id).first();
@@ -493,7 +511,11 @@ async function admin(req, env, ctx, path) {
       if (body.reset) await q(env, 'UPDATE keys SET status = \'ok\', until = 0, note = \'\' WHERE id = ?', id).run();
       return json({ ok: true });
     }
-    if (m === 'DELETE') { await q(env, 'DELETE FROM keys WHERE id = ?', id).run(); return json({ ok: true }); }
+    if (m === 'DELETE') {
+      await q(env, 'DELETE FROM keys WHERE id = ?', id).run();
+      await q(env, 'UPDATE devices SET key_id = 0 WHERE key_id = ?', id).run();
+      return json({ ok: true });
+    }
   }
 
   if (seg[1] === 'reports') {
@@ -513,17 +535,29 @@ async function admin(req, env, ctx, path) {
 
   if (seg[1] === 'devices') {
     if (seg.length === 2 && m === 'GET') {
-      const { results } = await q(env, 'SELECT * FROM devices ORDER BY last_seen DESC LIMIT 300').all();
+      const { results } = await q(env, 'SELECT d.*, k.label AS key_label, k.provider AS key_provider FROM devices d LEFT JOIN keys k ON k.id = d.key_id ORDER BY d.last_seen DESC LIMIT 300').all();
       const t0 = dayStart();
       const { results: counts } = await q(env, 'SELECT device, COUNT(DISTINCT report) AS n FROM events WHERE kind = \'report\' AND ts >= ? GROUP BY device', t0).all();
       const today = Object.fromEntries(counts.map((c) => [c.device, c.n]));
-      return json({ devices: results.map((d) => ({ ...d, blocked: !!d.blocked, today: today[d.id] || 0 })) });
+      return json({ devices: results.map((d) => ({ ...d, key_id: d.key_label ? d.key_id : 0, blocked: !!d.blocked, today: today[d.id] || 0 })) });
     }
     if (m === 'PATCH') {
       const id = decodeURIComponent(seg[2] || '');
       if (typeof body.blocked === 'boolean') await q(env, 'UPDATE devices SET blocked = ? WHERE id = ?', body.blocked ? 1 : 0, id).run();
-      if (typeof body.name === 'string') await q(env, 'UPDATE devices SET name = ? WHERE id = ?', clip(body.name.trim(), 80), id).run();
-      return json({ ok: true });
+      if (typeof body.name === 'string') await q(env, 'UPDATE devices SET name = ?, named = 1 WHERE id = ?', clip(body.name.trim(), 80), id).run();
+      // مفتاح هذا المستخدم: مفتاح جديد يُضاف له، أو أحد المفاتيح الموجودة، أو 0 = المفاتيح المشتركة
+      let keyId = body.keyId;
+      if (body.newKey) {
+        const dev = await q(env, 'SELECT name FROM devices WHERE id = ?', id).first();
+        const r = await addKey(env, { ...body.newKey, label: body.newKey.label || `مفتاح ${dev?.name || 'مستخدم'}` });
+        if (r.error) return json(r, 400);
+        keyId = r.id;
+      }
+      if (Number.isInteger(keyId) && keyId >= 0) {
+        if (keyId && !(await q(env, 'SELECT id FROM keys WHERE id = ?', keyId).first())) return json({ error: 'المفتاح غير موجود' }, 404);
+        await q(env, 'UPDATE devices SET key_id = ? WHERE id = ?', keyId, id).run();
+      }
+      return json({ ok: true, keyId: keyId ?? null });
     }
   }
 
