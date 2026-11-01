@@ -31,7 +31,7 @@ const CLAUDE_MODELS = ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5
 const FREE_ROUTER = 'openrouter/free';
 
 const DEFAULT_CONFIG = {
-  appName: 'أساس',
+  appName: 'sadiqabbas',
   provider: 'openrouter',      // ما يكتب به المستخدمون: openrouter | anthropic
   textModels: [],              // [{ id, name, vision, structured }] حتى ثلاثة، بالترتيب (بدائل تلقائية)
   visionModel: null,           // { id, name } للتحقق من الصور
@@ -441,7 +441,7 @@ async function admin(req, env, ctx, path) {
   if (path === '/admin/config' && m === 'PUT') {
     const cfg = await getConfig(env);
     const next = { ...cfg };
-    if (typeof body.appName === 'string') next.appName = clip(body.appName.trim(), 40) || 'أساس';
+    if (typeof body.appName === 'string') next.appName = clip(body.appName.trim(), 40) || 'sadiqabbas';
     if (['openrouter', 'anthropic'].includes(body.provider)) next.provider = body.provider;
     if (Array.isArray(body.textModels)) next.textModels = body.textModels.filter((x) => x?.id).slice(0, 3).map((x) => ({ id: clip(x.id, 120), name: clip(x.name || x.id, 80), vision: !!x.vision, structured: !!x.structured, json: !!x.json, ctx: Number(x.ctx) || 0, maxOut: Number(x.maxOut) || 0 }));
     if (body.visionModel === null || body.visionModel?.id) next.visionModel = body.visionModel ? { id: clip(body.visionModel.id, 120), name: clip(body.visionModel.name || body.visionModel.id, 80), structured: !!body.visionModel.structured, json: !!body.visionModel.json } : null;
