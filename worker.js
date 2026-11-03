@@ -19,6 +19,7 @@
  * المسارات:
  *   GET  /api/config                    إعدادات التطبيق العامة (للمستخدمين)
  *   POST /api/log                       سجل تقرير انتهى (العنوان والنص)
+ *   POST /api/pdf                       ملف PDF للتقرير (يبنيه التطبيق) يُرسل إلى تيليغرام المدير
  *   *    /or/api/v1/...                 بديل OpenRouter (models، key، chat/completions) — يكتب عبر OpenRouter أو Gemini
  *   POST /anthropic/v1/messages         بديل Claude (و/v1/messages للتوافق مع الخادم الوسيط القديم)
  *   *    /admin/...                     لوحة المدير (Authorization: Bearer ADMIN_PASSWORD)
@@ -71,6 +72,7 @@ const SCHEMA = [
 const MIGRATIONS = [
   'ALTER TABLE devices ADD COLUMN key_id INTEGER DEFAULT 0', // مفتاح خاص يعيّنه المدير لهذا المستخدم
   'ALTER TABLE devices ADD COLUMN named INTEGER DEFAULT 0',  // المدير غيّر الاسم: لا يكتبه التطبيق فوقه
+  'ALTER TABLE reports ADD COLUMN pdf INTEGER DEFAULT 0',    // أُرسل PDF التقرير إلى تيليغرام
 ];
 
 const CORS = {
@@ -116,26 +118,46 @@ const saveConfig = (env, cfg) => q(env, 'INSERT INTO settings (k, v) VALUES (?, 
 
 /* ── تيليغرام ─────────────────────────────────────── */
 
+/** معرّفات المحادثات: رقم شخص أو مجموعة (يبدأ بـ -100) أو @قناة، مفصولة بفاصلة أو سطر. */
+function chatsOf(cfg) {
+  return [...new Set(String(cfg.telegram?.chat || '').split(/[\s,،;]+/).map((x) => x.trim())
+    .filter((x) => /^-?\d{3,20}$/.test(x) || /^@\w{4,40}$/.test(x)))].slice(0, 10);
+}
+
+/**
+ * يرسل رسالة (أو ملفًا) إلى كل المعرّفات. الملف { content, name, type } يُرفع مرة واحدة،
+ * ثم يُرسل للبقية بمعرّفه في تيليغرام (file_id) دون رفعه من جديد.
+ */
 async function telegram(env, cfg, text, file = null) {
-  const { token, chat } = cfg.telegram || {};
-  if (!token || !chat) return { ok: false, error: 'لم يُضبط بوت تيليغرام' };
+  const token = cfg.telegram?.token;
+  const chats = chatsOf(cfg);
+  if (!token || !chats.length) return { ok: false, sent: 0, results: [], error: 'لم يُضبط بوت تيليغرام' };
   const base = `${env.TELEGRAM_API || TG_BASE}/bot${token}`;
-  try {
-    let res;
-    if (file) {
-      const fd = new FormData();
-      fd.append('chat_id', chat);
-      fd.append('caption', clip(text, 1000));
-      fd.append('document', new Blob([file.content], { type: 'text/markdown' }), file.name);
-      res = await fetch(`${base}/sendDocument`, { method: 'POST', body: fd });
-    } else {
-      res = await fetch(`${base}/sendMessage`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ chat_id: chat, text: clip(text, 4000), disable_web_page_preview: true }) });
+  const caption = clip(text, 1000);
+  let fileId = null;
+  const results = [];
+  for (const chat of chats) {
+    try {
+      let res;
+      if (file && !fileId) {
+        const fd = new FormData();
+        fd.append('chat_id', chat);
+        fd.append('caption', caption);
+        fd.append('document', new Blob([file.content], { type: file.type || 'application/octet-stream' }), file.name);
+        res = await fetch(`${base}/sendDocument`, { method: 'POST', body: fd });
+      } else {
+        const body = file ? { chat_id: chat, document: fileId, caption } : { chat_id: chat, text: clip(text, 4000), disable_web_page_preview: true };
+        res = await fetch(`${base}/${file ? 'sendDocument' : 'sendMessage'}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+      }
+      const body = await res.json().catch(() => ({}));
+      if (body.ok && file && !fileId) fileId = body.result?.document?.file_id || null;
+      results.push({ chat, ok: !!body.ok, error: body.ok ? '' : String(body.description || `HTTP ${res.status}`) });
+    } catch (e) {
+      results.push({ chat, ok: false, error: String(e?.message || e) });
     }
-    const body = await res.json().catch(() => ({}));
-    return body.ok ? { ok: true } : { ok: false, error: body.description || `HTTP ${res.status}` };
-  } catch (e) {
-    return { ok: false, error: String(e?.message || e) };
   }
+  const sent = results.filter((r) => r.ok).length;
+  return { ok: sent > 0, sent, results, error: sent === results.length ? '' : results.filter((r) => !r.ok).map((r) => `${r.chat}: ${r.error}`).join('، ') };
 }
 
 /* ── المفاتيح ─────────────────────────────────────── */
@@ -479,14 +501,9 @@ async function publicConfig(req, env) {
     lock: !!cfg.lock,
     notice: cfg.notice || '',
     publicTypes: Array.isArray(cfg.publicTypes) ? cfg.publicTypes : ['theory'],
+    pdf: !!(cfg.notify.reports && cfg.telegram?.token && chatsOf(cfg).length), // يبني التطبيق PDF التقرير ويرسله
     ready: keys > 0,
   });
-}
-
-function reportFile(r) {
-  const head = [`# ${r.title}`, '', `- الطالب: ${r.name || '—'}${r.people ? ` (${r.people})` : ''}`, `- النوع: ${r.type || '—'} — المادة: ${r.subject || '—'}`,
-    `- الجامعة: ${r.uni || '—'}`, `- الكلمات: ${r.words || 0} — النموذج: ${r.model || '—'}`, `- التاريخ: ${new Date(r.ts).toISOString().replace('T', ' ').slice(0, 16)} UTC`, '', '---', ''];
-  return head.join('\n') + (r.text || '');
 }
 
 async function logReport(req, env, ctx) {
@@ -509,17 +526,45 @@ async function logReport(req, env, ctx) {
     model = excluded.model, people = excluded.people, text = excluded.text, name = excluded.name`,
   r.id, r.device, r.name, r.ts, r.title, r.type, r.subject, r.lang, r.words, r.status, r.model, r.people, r.uni, r.text).run();
   await q(env, `INSERT INTO devices (id, name, first_seen, last_seen, platform) VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(id) DO UPDATE SET last_seen = excluded.last_seen, name = CASE WHEN excluded.name <> '' THEN excluded.name ELSE name END`,
+    ON CONFLICT(id) DO UPDATE SET last_seen = excluded.last_seen, name = CASE WHEN excluded.name <> '' AND named = 0 THEN excluded.name ELSE name END`,
   dev.id, r.name, r.ts, r.ts, dev.platform).run();
   if (r.status === 'ready' && prev?.status !== 'ready') {
     await q(env, 'UPDATE devices SET reports = reports + 1 WHERE id = ?', dev.id).run();
-    if (cfg.notify.reports) {
-      const caption = `📄 تقرير جديد\n${r.title}\n👤 ${r.name || 'بلا اسم'}${r.people ? ` — ${r.people}` : ''}\n📚 ${[r.type, r.subject].filter(Boolean).join(' — ')}\n📝 ${r.words} كلمة — ${r.model || 'دون اتصال'}`;
-      const safe = r.title.replace(/[\\/:*?"<>|\n]+/g, ' ').slice(0, 60) || 'report';
-      ctx.waitUntil(telegram(env, cfg, caption, { name: `${safe}.md`, content: reportFile(r) }));
+    // التطبيق الحديث يرسل بعدها ملف PDF للتقرير (/api/pdf)؛ النسخ القديمة لا تستطيع، فتصل عنها رسالة قصيرة فقط
+    if (cfg.notify.reports && req.headers.get('x-asas-pdf') !== '1') {
+      ctx.waitUntil(telegram(env, cfg, `${reportCaption(r)}\n\n(من نسخة قديمة من التطبيق: لا يصل منها ملف PDF — حدّث التطبيق)`));
     }
   }
   return json({ ok: true });
+}
+
+/** وصف التقرير في رسالة تيليغرام. */
+function reportCaption(r) {
+  return [`📄 تقرير جديد`, r.title, `👤 ${r.name || 'بلا اسم'}${r.people ? ` — ${r.people}` : ''}`,
+    [r.type, r.subject].filter(Boolean).length ? `📚 ${[r.type, r.subject].filter(Boolean).join(' — ')}` : '',
+    r.uni ? `🏛 ${r.uni}` : '', `📝 ${r.words || 0} كلمة — ${r.model || 'دون اتصال'}`].filter(Boolean).join('\n');
+}
+
+/** ملف PDF للتقرير (يبنيه التطبيق بعد اكتماله) يُرسل إلى كل معرّفات تيليغرام المدير مرة واحدة. */
+async function reportPdf(req, env) {
+  const cfg = await getConfig(env);
+  const dev = deviceOf(req);
+  if (!dev.id) return json({ ok: false, error: 'جهاز غير معروف' }, 400);
+  const row = await q(env, 'SELECT blocked FROM devices WHERE id = ?', dev.id).first();
+  if (!row || row.blocked) return json({ ok: false, error: 'غير مسموح' }, 403);
+  const id = clip(dec(req.headers.get('x-asas-report')), 64);
+  const r = id ? await q(env, 'SELECT id, title, name, people, type, subject, uni, words, model, pdf FROM reports WHERE id = ? AND device = ?', id, dev.id).first() : null;
+  if (!r) return json({ ok: false, error: 'التقرير غير مسجّل بعد' }, 404);
+  if (r.pdf) return json({ ok: true, sent: 0, already: true });
+  if (!cfg.notify.reports || !cfg.telegram?.token || !chatsOf(cfg).length) return json({ ok: true, sent: 0, skipped: true });
+  if ((Number(req.headers.get('content-length')) || 0) > 45 * 1024 * 1024) return json({ ok: false, error: 'الملف أكبر من حد تيليغرام' }, 413);
+  const pdf = await req.arrayBuffer();
+  const head = new Uint8Array(pdf, 0, Math.min(5, pdf.byteLength));
+  if (pdf.byteLength < 200 || String.fromCharCode(...head) !== '%PDF-') return json({ ok: false, error: 'ليس ملف PDF' }, 400);
+  const name = `${String(r.title || 'تقرير').replace(/[\\/:*?"<>|\n\r\t]+/g, ' ').trim().slice(0, 80) || 'تقرير'}.pdf`;
+  const out = await telegram(env, cfg, reportCaption(r), { content: pdf, name, type: 'application/pdf' });
+  if (out.sent) await q(env, 'UPDATE reports SET pdf = 1 WHERE id = ?', r.id).run();
+  return json({ ok: out.ok, sent: out.sent, error: out.error }, out.ok ? 200 : 502);
 }
 
 /* ── لوحة المدير ──────────────────────────────────── */
@@ -596,7 +641,7 @@ async function admin(req, env, ctx, path) {
     if (Array.isArray(body.publicTypes)) next.publicTypes = [...new Set(body.publicTypes.filter((x) => typeof x === 'string').map((x) => clip(x, 30)))].slice(0, 20);
     if (body.telegram) {
       next.telegram = { ...cfg.telegram };
-      if (typeof body.telegram.chat === 'string') next.telegram.chat = clip(body.telegram.chat.trim(), 40);
+      if (typeof body.telegram.chat === 'string') next.telegram.chat = clip(body.telegram.chat.split(/[\s,،;]+/).filter(Boolean).join(', '), 400);
       if (typeof body.telegram.token === 'string' && !body.telegram.token.includes('•')) next.telegram.token = clip(body.telegram.token.trim(), 100);
     }
     if (body.notify) next.notify = { ...cfg.notify, ...Object.fromEntries(Object.entries(body.notify).filter(([, v]) => typeof v === 'boolean')) };
@@ -620,7 +665,7 @@ async function admin(req, env, ctx, path) {
   }
 
   if (path === '/admin/telegram/test' && m === 'POST') {
-    const r = await telegram(env, await getConfig(env), '✅ تم ربط تيليغرام بخادم «أساس». ستصلك هنا التقارير الجديدة وتنبيهات المفاتيح.');
+    const r = await telegram(env, await getConfig(env), '✅ تم ربط تيليغرام بخادم التطبيق. ستصلك هنا التقارير الجديدة (ملفات PDF) وتنبيهات المفاتيح.');
     return json(r, r.ok ? 200 : 400);
   }
 
@@ -1021,6 +1066,7 @@ export default {
       if (env.APP_TOKEN && req.headers.get('x-app-token') !== env.APP_TOKEN) return orErr(403, 'رمز التطبيق غير صحيح.');
       if (path === '/api/config') return await publicConfig(req, env);
       if (path === '/api/log' && req.method === 'POST') return await logReport(req, env, ctx);
+      if (path === '/api/pdf' && req.method === 'POST') return await reportPdf(req, env);
       if (path.startsWith('/or/api/v1/')) return await proxyOpenRouter(req, env, ctx, path.slice('/or/api/v1'.length));
       if ((path === '/anthropic/v1/messages' || path === '/v1/messages') && req.method === 'POST') return await proxyAnthropic(req, env, ctx);
       return json({ error: 'المسار غير مدعوم' }, 404);
