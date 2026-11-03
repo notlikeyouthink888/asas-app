@@ -9,3 +9,13 @@ compatibility_date = "2025-01-01"
 [[d1_databases]]
 binding = "DB"
 database_name = "asas-app-db"
+
+# مهام الكتابة في الخادم نفسه (ReportJob): يستمر التقرير ولو انقطع اتصال الهاتف أو أُغلق التطبيق.
+# Durable Objects بتخزين SQLite متاحة في الخطة المجانية، وتُنشأ تلقائيًا عند النشر.
+[[durable_objects.bindings]]
+name = "JOBS"
+class_name = "ReportJob"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ReportJob"]

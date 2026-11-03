@@ -22,6 +22,9 @@
  *   *    /or/api/v1/...                 بديل OpenRouter (models، key، chat/completions) — يكتب عبر OpenRouter أو Gemini
  *   POST /anthropic/v1/messages         بديل Claude (و/v1/messages للتوافق مع الخادم الوسيط القديم)
  *   *    /admin/...                     لوحة المدير (Authorization: Bearer ADMIN_PASSWORD)
+ *
+ * طلبات البث التي تحمل x-asas-job تُكتب في الخادم نفسه (ReportJob أدناه): تستمر الكتابة ولو انقطع
+ * اتصال الهاتف، ويعيد الهاتف الاتصال بالرأس x-asas-from ليكمل من آخر بايت وصله.
  */
 
 const OR_BASE = 'https://openrouter.ai/api/v1';
@@ -283,6 +286,8 @@ async function proxyOpenRouter(req, env, ctx, path) {
   if (path === '/key') return json({ data: { label: 'خادم التطبيق', limit: null, usage: 0, is_free_tier: false } });
   if (path !== '/chat/completions' || req.method !== 'POST') return orErr(404, 'مسار غير مدعوم');
   if (cfg.provider === 'anthropic') return orErr(409, 'غيّر مدير التطبيق طريقة الكتابة؛ أعد فتح التطبيق.');
+  const job = await viaJob(req, env, 'openai');
+  if (job) return job;
   const dev = deviceOf(req);
   const meta = metaOf(req);
   const denied = await admit(env, cfg, ctx, dev, meta, 'openrouter');
@@ -290,6 +295,11 @@ async function proxyOpenRouter(req, env, ctx, path) {
 
   let body;
   try { body = await req.json(); } catch { return orErr(400, 'طلب غير صالح'); }
+  return openaiUpstream(env, ctx, cfg, dev, meta, body);
+}
+
+/** يكتب بصيغة OpenAI عبر OpenRouter أو Gemini. يعيد رد المزوّد (بثًا أو خطأ). */
+async function openaiUpstream(env, ctx, cfg, dev, meta, body) {
   // المزوّد الذي اختاره المدير أولًا، والآخر احتياطًا إن كانت له مفاتيح (الصيغة نفسها)
   const order = cfg.provider === 'gemini' ? ['gemini', 'openrouter'] : ['openrouter', 'gemini'];
   for (const prov of order) {
@@ -398,17 +408,24 @@ async function viaGemini(env, ctx, cfg, dev, meta, src) {
 async function proxyAnthropic(req, env, ctx) {
   const cfg = await getConfig(env);
   if (cfg.provider !== 'anthropic') return anErr(409, 'invalid_request_error', 'غيّر مدير التطبيق طريقة الكتابة؛ أعد فتح التطبيق.');
+  const job = await viaJob(req, env, 'anthropic');
+  if (job) return job;
   const dev = deviceOf(req);
   const meta = metaOf(req);
   const denied = await admit(env, cfg, ctx, dev, meta, 'anthropic');
   if (denied) return denied;
   let body;
   try { body = await req.json(); } catch { return anErr(400, 'invalid_request_error', 'طلب غير صالح'); }
+  return anthropicUpstream(env, ctx, cfg, dev, meta, body, { version: req.headers.get('anthropic-version') || '', beta: req.headers.get('anthropic-beta') || '' });
+}
+
+/** يكتب عبر Claude بمفاتيح الخادم بالترتيب. hdr: رأسا anthropic-version وanthropic-beta من التطبيق. */
+async function anthropicUpstream(env, ctx, cfg, dev, meta, body, hdr) {
   body.model = CLAUDE_MODELS.includes(cfg.claudeModel) ? cfg.claudeModel : 'claude-sonnet-5-5';
   body.max_tokens = Math.min(Number(body.max_tokens) || 4000, 64000);
   const haiku = body.model === 'claude-haiku-5-5';
   if (haiku) delete body.fallbacks;
-  const beta = String(req.headers.get('anthropic-beta') || '').split(',').map((s) => s.trim())
+  const beta = String(hdr.beta || '').split(',').map((s) => s.trim())
     .filter((b) => b && !(haiku && b.startsWith('server-side-fallback'))).join(',');
 
   const base = env.ANTHROPIC_UPSTREAM || AN_BASE;
@@ -421,7 +438,7 @@ async function proxyAnthropic(req, env, ctx) {
       return anErr(503, 'overloaded_error', 'انتهت حصة خادم التطبيق مؤقتًا. أخبر مدير التطبيق أو حاول لاحقًا.');
     }
     tried.add(key.id);
-    const h = new Headers({ 'content-type': 'application/json', 'x-api-key': key.secret, 'anthropic-version': req.headers.get('anthropic-version') || '2023-06-01' });
+    const h = new Headers({ 'content-type': 'application/json', 'x-api-key': key.secret, 'anthropic-version': hdr.version || '2023-06-01' });
     if (beta) h.set('anthropic-beta', beta);
     const t0 = now();
     const res = await fetch(`${base}/v1/messages`, { method: 'POST', headers: h, body: JSON.stringify(body) });
@@ -686,6 +703,304 @@ async function admin(req, env, ctx, path) {
   }
 
   return json({ error: 'مسار غير موجود' }, 404);
+}
+
+/* ── كتابة التقارير في الخادم نفسه (Durable Object) ─────────────────────
+ * طلب البث الذي يحمل x-asas-job يصير «مهمة»: الخادم يتصل بالمزوّد ويحفظ كل ما يصله أولًا بأول،
+ * والتطبيق يقرأ منه. إن انقطع اتصال الهاتف (خروج من التطبيق، شبكة ضعيفة، تبدّل الواي فاي، إغلاقه)
+ * تستمر الكتابة في الخادم، ويعيد الهاتف الاتصال بالرأس x-asas-from (عدد البايتات التي وصلته)
+ * فيكمل من حيث توقف، أو يستلم التقرير كاملًا حين يعود.
+ * البث يُحفظ بايتات كما هي (بلا فك ولا تحليل) فلا يكاد يستهلك وقت معالج (حد الخطة المجانية صغير).
+ * ينتهي رد المهمة بسطر «: asas-end» ليعرف التطبيق أن البث اكتمل ولم ينقطع.
+ */
+
+const JOB_KEEP = 3 * 3600000;  // المهمة المنتهية تبقى محفوظة 3 ساعات ليستلمها الهاتف متى عاد
+const JOB_MAX = 13 * 60000;    // أقصى مدة للكتابة الواحدة (حد Cloudflare للمنبّه 15 دقيقة)
+const JOB_FIRST = 60000;       // طلب البدء ينتظر أول رد من المزوّد حتى دقيقة (ليصل خطأ الحصة كما هو)
+const JOB_PING = 15000;        // سطر «ping» حين يسكت المزوّد طويلًا حتى لا تغلق الشبكات الاتصال
+const JOB_STALE = 45000;       // مهمة «جارية» بلا نبض منذ هذه المدة = توقفت في الخادم
+const PART_MAX = 100000;       // أكبر جزء يُحفظ في قيمة واحدة
+const END_MARK = '\n: asas-end\n\n';
+const enc = new TextEncoder();
+const pause = (ms) => { let t; return { done: new Promise((r) => { t = setTimeout(r, ms); }), cancel: () => clearTimeout(t) }; };
+
+const jobIdOf = (req) => { const id = String(req.headers.get('x-asas-job') || '').trim(); return /^[\w-]{8,80}$/.test(id) ? id : ''; };
+const jobGone = () => json({ error: { code: 410, message: 'ASAS: انتهت مهمة الكتابة في الخادم' } }, 410);
+
+function concatBytes(list) {
+  if (list.length === 1) return list[0];
+  const out = new Uint8Array(list.reduce((n, a) => n + a.byteLength, 0));
+  let o = 0;
+  for (const a of list) { out.set(a, o); o += a.byteLength; }
+  return out;
+}
+
+/** موضع نهاية آخر حدث SSE كامل (بعد السطر الفارغ)، أو -1. يبحث من النهاية حتى from فقط. */
+function lastBoundary(b, from = 0) {
+  for (let i = b.byteLength - 1; i >= Math.max(1, from - 3); i--) {
+    if (b[i] !== 10) continue;
+    if (b[i - 1] === 10 || (i > 1 && b[i - 1] === 13 && b[i - 2] === 10)) return i + 1;
+  }
+  return -1;
+}
+
+/** خطأ بعد بدء البث: حدث في البث نفسه بصيغة المزوّد، فيفهمه التطبيق كأي خطأ. */
+function inbandError(fmt, status, text) {
+  const message = errMsg(text) || `HTTP ${status}`;
+  return fmt === 'anthropic'
+    ? `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: status >= 500 ? 'overloaded_error' : status === 429 ? 'rate_limit_error' : 'invalid_request_error', message } })}\n\n`
+    : `data: ${JSON.stringify({ error: { code: status, message } })}\n\n`;
+}
+
+/** يمرّر طلب البث إلى مهمته في الخادم. null = المهام غير مفعّلة فيُمرَّر مباشرة كالسابق. */
+async function viaJob(req, env, fmt) {
+  const id = jobIdOf(req);
+  if (!id || !env.JOBS) return null;
+  const from = Number(req.headers.get('x-asas-from')) || 0;
+  try {
+    const stub = env.JOBS.get(env.JOBS.idFromName(id));
+    return await stub.fetch(new Request(`https://job/${fmt}`, { method: 'POST', headers: req.headers, body: await req.clone().text() }));
+  } catch (e) {
+    console.warn('[job]', e?.message || e);
+    // تعذّر الوصول للمهمة (مثلًا حصة Durable Objects اليومية): طلب جديد يُمرَّر مباشرة،
+    // أما إعادة الاتصال بمهمة جارية فيعيد التطبيق محاولتها
+    return from > 0 ? json({ error: { code: 503, message: 'ASAS: الخادم مشغول، يعيد الاتصال…' } }, 503) : null;
+  }
+}
+
+export class ReportJob {
+  constructor(state, env) {
+    this.state = state;
+    this.storage = state.storage;
+    this.env = env;
+    this.reset();
+  }
+
+  reset() {
+    this.meta = null;      // { id, fmt, dev, state: pending|running|done, status, ctype, httpErr, tail, beat, expires }
+    this.parts = [];       // البث كما وصل من المزوّد (Uint8Array) بالترتيب
+    this.size = 0;
+    this.savedParts = 0;
+    this.savedKeys = 0;
+    this.rest = null;      // بقية حدث لم يكتمل بعد
+    this.subs = new Set(); // قرّاء متصلون الآن
+    this.waiters = [];     // ينتظرون أول رد من المزوّد
+    this.running = false;
+    this.loading = null;
+  }
+
+  load() {
+    this.loading ||= (async () => {
+      this.meta = (await this.storage.get('meta')) || null;
+      if (!this.meta) return;
+      const saved = await this.storage.list({ prefix: 'p:' });
+      this.parts = [...saved.values()];
+      this.size = this.parts.reduce((n, p) => n + p.byteLength, 0);
+      this.savedParts = this.parts.length;
+      this.savedKeys = saved.size;
+    })().catch((e) => { this.loading = null; throw e; });
+    return this.loading;
+  }
+
+  async fetch(req) {
+    await this.load();
+    const fmt = new URL(req.url).pathname === '/anthropic' ? 'anthropic' : 'openai';
+    const from = Math.max(0, Number(req.headers.get('x-asas-from')) || 0);
+    const dev = deviceOf(req);
+    if (this.meta) {
+      if (this.meta.dev && this.meta.dev !== dev.id) return orErr(403, 'هذه المهمة تخص جهازًا آخر.');
+      return this.attach(from);
+    }
+    if (from > 0) return jobGone();
+    // مهمة جديدة: الفحوص نفسها كالطلب المباشر (الإيقاف، الحد اليومي، الإغراق)
+    await init(this.env);
+    const cfg = await getConfig(this.env);
+    const meta = metaOf(req);
+    const ctx = { waitUntil: (p) => { Promise.resolve(p).catch(() => {}); } };
+    const denied = await admit(this.env, cfg, ctx, dev, meta, fmt === 'anthropic' ? 'anthropic' : 'openrouter');
+    if (denied) return denied;
+    let body;
+    try { body = await req.json(); } catch { return fmt === 'anthropic' ? anErr(400, 'invalid_request_error', 'طلب غير صالح') : orErr(400, 'طلب غير صالح'); }
+    if (this.meta) return this.attach(from); // طلبان متزامنان للمهمة نفسها: الثاني يقرأ فقط
+    this.meta = { id: jobIdOf(req), fmt, dev: dev.id, state: 'pending', created: now(), beat: now(), status: 0, ctype: '', httpErr: null, tail: false, size: 0, expires: 0 };
+    const hdr = { version: req.headers.get('anthropic-version') || '', beta: req.headers.get('anthropic-beta') || '' };
+    await this.storage.put({ meta: this.meta, job: { body, dev, meta, hdr } });
+    await this.storage.setAlarm(now());
+    return this.attach(0);
+  }
+
+  /** رد يقرأ البث من البايت from: ما حُفظ ثم ما يصل تباعًا، وينتهي بـ «: asas-end». */
+  async attach(from) {
+    const m = this.meta;
+    if (m.state === 'running' && !this.running && now() - (m.beat || m.created) > JOB_STALE) await this.interrupted();
+    if (!m.status && m.state !== 'done') {
+      const p = pause(JOB_FIRST);
+      await Promise.race([new Promise((r) => this.waiters.push(r)), p.done]);
+      p.cancel();
+    }
+    if (m.httpErr && !m.tail) {
+      // خطأ قبل بدء البث: لطلب البدء يُعاد كما هو (الحصة، الإيقاف…)، ولإعادة الاتصال «انتهت المهمة» فيكمل التطبيق بطلب جديد
+      if (from > 0) return jobGone();
+      return new Response(m.httpErr.body, { status: m.httpErr.status, headers: { ...CORS, 'content-type': 'application/json' } });
+    }
+    if (!m.tail) { m.tail = true; await this.storage.put('meta', m); }
+    const { readable, writable } = new TransformStream();
+    const sub = { w: writable.getWriter() };
+    let pos = 0;
+    for (const p of this.parts) {
+      const end = pos + p.byteLength;
+      if (end > from) this.send(sub, from > pos ? p.subarray(from - pos) : p);
+      pos = end;
+    }
+    if (m.state === 'done') this.end(sub); else this.subs.add(sub);
+    return new Response(readable, {
+      status: 200,
+      headers: { ...CORS, 'content-type': m.ctype || 'text/event-stream; charset=utf-8', 'cache-control': 'no-store', 'x-asas-job': m.id },
+    });
+  }
+
+  send(sub, chunk) { sub.w.write(chunk).catch(() => this.subs.delete(sub)); }
+
+  end(sub) {
+    this.subs.delete(sub);
+    sub.w.write(enc.encode(END_MARK)).catch(() => {});
+    sub.w.close().catch(() => {});
+  }
+
+  push(bytes) {
+    if (!bytes?.byteLength) return;
+    this.parts.push(bytes);
+    this.size += bytes.byteLength;
+    for (const s of this.subs) this.send(s, bytes);
+  }
+
+  /** يضيف بايتات المزوّد عند حدود الأحداث فقط، فيبقى كل حدث كاملًا ويصح إدراج ping أو خطأ بينها. */
+  take(chunk) {
+    if (!chunk) { if (this.rest) { this.push(this.rest); this.rest = null; } return; }
+    const had = this.rest ? this.rest.byteLength : 0;
+    const buf = this.rest ? concatBytes([this.rest, chunk]) : chunk;
+    const cut = lastBoundary(buf, had);
+    if (cut < 0) { this.rest = buf; return; }
+    this.push(cut === buf.byteLength ? buf : buf.slice(0, cut));
+    this.rest = cut === buf.byteLength ? null : buf.slice(cut);
+  }
+
+  wake() { const w = this.waiters; this.waiters = []; w.forEach((r) => r()); }
+
+  async alarm() {
+    await this.load();
+    const m = this.meta;
+    if (!m) return;
+    if (m.state === 'done') {
+      if (now() >= (m.expires || 0) - 1000) { await this.storage.deleteAll(); this.reset(); }
+      else await this.storage.setAlarm(m.expires);
+      return;
+    }
+    if (m.state === 'running') { if (!this.running) await this.interrupted(); return; }
+    await this.run();
+  }
+
+  async run() {
+    const m = this.meta;
+    m.state = 'running';
+    m.beat = now();
+    this.running = true;
+    await this.storage.put('meta', m);
+    const pend = [];
+    const ctx = { waitUntil: (p) => { pend.push(Promise.resolve(p).catch(() => {})); } };
+    try {
+      const job = await this.storage.get('job');
+      await init(this.env);
+      const cfg = await getConfig(this.env);
+      const res = m.fmt === 'anthropic'
+        ? await anthropicUpstream(this.env, ctx, cfg, job.dev, job.meta, job.body, job.hdr)
+        : await openaiUpstream(this.env, ctx, cfg, job.dev, job.meta, job.body);
+      m.ctype = res.headers.get('content-type') || 'text/event-stream';
+      if (res.ok && res.body) {
+        m.status = res.status;
+        this.wake();
+        await this.pipe(res.body);
+      } else {
+        this.fail(res.status, await res.text());
+      }
+    } catch (e) {
+      this.fail(500, JSON.stringify({ error: { code: 500, message: `ASAS: خطأ في خادم التطبيق: ${String(e?.message || e).slice(0, 200)}` } }));
+    }
+    await this.finish();
+    await Promise.all(pend);
+  }
+
+  /** يقرأ بث المزوّد إلى النهاية مهما حدث للهاتف. */
+  async pipe(body) {
+    const reader = body.getReader();
+    let last = now();
+    const ping = setInterval(() => {
+      if (now() - last >= JOB_PING && !this.rest) { this.push(enc.encode(': ping\n\n')); last = now(); }
+    }, 5000);
+    const save = setInterval(() => { this.flush().catch(() => {}); }, 3000);
+    const stop = setTimeout(() => { reader.cancel().catch(() => {}); }, JOB_MAX);
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (!value?.byteLength) continue;
+        last = now();
+        this.take(value);
+      }
+      this.take(null);
+    } catch (e) {
+      // انقطع اتصال الخادم بالمزوّد نفسه: خطأ عابر يكمل بعده التطبيق من حيث وصل
+      this.take(null);
+      this.push(enc.encode(`\n\n${inbandError(this.meta.fmt, 502, JSON.stringify({ error: { message: `انقطع اتصال الخادم بالمزوّد: ${String(e?.message || e).slice(0, 120)}` } }))}`));
+    } finally {
+      clearInterval(ping);
+      clearInterval(save);
+      clearTimeout(stop);
+    }
+  }
+
+  /** خطأ من المزوّد: قبل بدء البث يُعاد ردًّا كما هو، وبعده حدثًا في البث. */
+  fail(status, text) {
+    const m = this.meta;
+    if (!m.status) m.status = status;
+    if (m.tail) this.push(enc.encode(inbandError(m.fmt, status, text)));
+    else m.httpErr = { status, body: text || JSON.stringify({ error: { code: status, message: `HTTP ${status}` } }) };
+    this.wake();
+  }
+
+  /** توقفت الكتابة في الخادم نفسه (إعادة تشغيل مثلًا): يكمل التطبيق بطلب جديد من حيث وصل. */
+  async interrupted() {
+    this.fail(502, JSON.stringify({ error: { code: 502, message: 'توقفت الكتابة في الخادم، يكمل من حيث توقف…' } }));
+    await this.finish();
+  }
+
+  async flush() {
+    const m = this.meta;
+    const fresh = this.parts.slice(this.savedParts);
+    this.savedParts = this.parts.length;
+    const puts = {};
+    if (fresh.length) {
+      const all = concatBytes(fresh);
+      for (let o = 0; o < all.byteLength; o += PART_MAX) puts[`p:${String(this.savedKeys++).padStart(6, '0')}`] = all.slice(o, o + PART_MAX);
+    }
+    m.beat = now();
+    m.size = this.size;
+    puts.meta = m;
+    await this.storage.put(puts);
+  }
+
+  async finish() {
+    this.take(null);
+    const m = this.meta;
+    m.state = 'done';
+    m.expires = now() + JOB_KEEP;
+    this.running = false;
+    await this.flush();
+    await this.storage.delete('job');
+    for (const s of [...this.subs]) this.end(s);
+    this.wake();
+    await this.storage.setAlarm(m.expires);
+  }
 }
 
 /* ── التوجيه ──────────────────────────────────────── */
