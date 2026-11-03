@@ -19,23 +19,28 @@
  * المسارات:
  *   GET  /api/config                    إعدادات التطبيق العامة (للمستخدمين)
  *   POST /api/log                       سجل تقرير انتهى (العنوان والنص)
- *   *    /or/api/v1/...                 بديل OpenRouter (models، key، chat/completions)
+ *   *    /or/api/v1/...                 بديل OpenRouter (models، key، chat/completions) — يكتب عبر OpenRouter أو Gemini
  *   POST /anthropic/v1/messages         بديل Claude (و/v1/messages للتوافق مع الخادم الوسيط القديم)
  *   *    /admin/...                     لوحة المدير (Authorization: Bearer ADMIN_PASSWORD)
  */
 
 const OR_BASE = 'https://openrouter.ai/api/v1';
 const AN_BASE = 'https://api.anthropic.com';
+const GEM_BASE = 'https://generativelanguage.googleapis.com/v1beta'; // + /openai/chat/completions (صيغة OpenAI)
 const TG_BASE = 'https://api.telegram.org';
 const CLAUDE_MODELS = ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'];
 const FREE_ROUTER = 'openrouter/free';
+// أسماء «latest» تشير دائمًا إلى أحدث نموذج Flash، فلا تختفي حين تُسحب النسخ القديمة
+const GEMINI_DEFAULT = [{ id: 'gemini-flash-latest', name: 'Gemini Flash' }, { id: 'gemini-flash-lite-latest', name: 'Gemini Flash-Lite' }];
+const PROVIDERS = ['openrouter', 'anthropic', 'gemini'];
 
 const DEFAULT_CONFIG = {
   appName: 'sadiqabbas',
-  provider: 'openrouter',      // ما يكتب به المستخدمون: openrouter | anthropic
+  provider: 'openrouter',      // ما يكتب به المستخدمون: openrouter | anthropic | gemini
   textModels: [],              // [{ id, name, vision, structured }] حتى ثلاثة، بالترتيب (بدائل تلقائية)
   visionModel: null,           // { id, name } للتحقق من الصور
   claudeModel: 'claude-sonnet-5-5',
+  geminiModels: GEMINI_DEFAULT, // [{ id, name }] حتى ثلاثة بالترتيب؛ حصة Gemini المجانية لكل نموذج على حدة
   dailyLimit: 10,              // تقارير لكل جهاز في اليوم (0 = بلا حد)
   open: true,                  // يقبل أجهزة جديدة
   lock: false,                 // يمنع المستخدمين من التحويل إلى مفاتيحهم
@@ -137,6 +142,15 @@ const KEY_STATUS = { daily: 'انتهت حصته اليومية', minute: 'تج�
 /** حكم استجابة فاشلة على المفتاح: هل نجرب المفتاح التالي؟ */
 function verdictOf(provider, status, text) {
   const t = String(text || '');
+  if (provider === 'gemini') {
+    if (status === 401 || status === 403 || /API_KEY_INVALID|API key not valid|API key expired/i.test(t)) return 'invalid';
+    if (status === 429) {
+      // «انتظر ساعات» = حصة اليوم انتهت؛ «ثوانٍ» = حد الدقيقة
+      const wait = Number((t.match(/retryDelay\W+(\d+)s/) || [])[1]) || 0;
+      return /PerDay|per day|daily|retry in \d+h/i.test(t) || wait > 3600 ? 'daily' : 'minute';
+    }
+    return null;
+  }
   if (status === 401 || (status === 403 && provider === 'anthropic')) return 'invalid';
   if (status === 402) return 'credits';
   if (provider === 'anthropic') {
@@ -152,7 +166,17 @@ function verdictOf(provider, status, text) {
   return null;
 }
 
-function untilFor(verdict) {
+/** نص الخطأ من رد المزوّد (Gemini يلفّه أحيانًا في مصفوفة). */
+function errMsg(text) {
+  try { let e = JSON.parse(text); if (Array.isArray(e)) e = e[0]; return String(e?.error?.message || e?.message || text); } catch { return String(text || ''); }
+}
+
+function untilFor(verdict, provider = '') {
+  if (verdict === 'daily' && provider === 'gemini') { // حصة Gemini تتجدد في منتصف ليل كاليفورنيا (≈ 08:00 UTC)
+    let t = dayStart() + 8 * 3600000 + 60000;
+    if (t <= now()) t += DAY;
+    return t;
+  }
   if (verdict === 'daily') return dayStart() + DAY + 60000; // بعد منتصف الليل (UTC) بدقيقة
   if (verdict === 'minute') return now() + 65000;
   if (verdict === 'credits') return now() + 2 * 3600000;
@@ -167,9 +191,8 @@ async function pickKey(env, provider, tried, own = 0) {
 }
 
 async function markKey(env, cfg, key, verdict, detail, ctx) {
-  let note = String(detail || '');
-  try { const e = JSON.parse(note); note = e.error?.message || e.message || note; } catch { /* نص */ }
-  await q(env, 'UPDATE keys SET status = ?, until = ?, note = ? WHERE id = ?', verdict, untilFor(verdict), clip(note, 200), key.id).run();
+  const note = errMsg(detail);
+  await q(env, 'UPDATE keys SET status = ?, until = ?, note = ? WHERE id = ?', verdict, untilFor(verdict, key.provider), clip(note, 200), key.id).run();
   if (verdict !== 'minute' && cfg.notify.keys) {
     ctx.waitUntil(telegram(env, cfg, `⚠️ مفتاح «${key.label}» ${KEY_STATUS[verdict]}.\nصار الخادم يستعمل المفتاح التالي تلقائيًا.`));
   }
@@ -226,7 +249,21 @@ function logEvent(env, ctx, dev, meta, model, keyId, status, ms) {
 
 /* ── بديل OpenRouter ──────────────────────────────── */
 
+const geminiChain = (cfg) => (cfg.geminiModels?.length ? cfg.geminiModels : GEMINI_DEFAULT).slice(0, 3);
+
 function modelsList(cfg) {
+  if (cfg.provider === 'gemini') {
+    // كل نماذج Gemini ترى الصور؛ JSON بوضع json_object (المخطط الصارم لا نعتمد عليه)
+    return {
+      data: geminiChain(cfg).map((m) => ({
+        id: m.id, name: m.name || m.id, context_length: 1048576,
+        architecture: { input_modalities: ['text', 'image'], output_modalities: ['text'] },
+        pricing: { prompt: '0', completion: '0', request: '0' },
+        top_provider: { context_length: 1048576, max_completion_tokens: 65536 },
+        supported_parameters: ['max_tokens', 'temperature', 'response_format'],
+      })),
+    };
+  }
   const all = [...cfg.textModels, ...(cfg.visionModel ? [{ ...cfg.visionModel, vision: true }] : [])];
   const seen = new Set();
   return {
@@ -245,7 +282,7 @@ async function proxyOpenRouter(req, env, ctx, path) {
   if (path === '/models') return json(modelsList(cfg));
   if (path === '/key') return json({ data: { label: 'خادم التطبيق', limit: null, usage: 0, is_free_tier: false } });
   if (path !== '/chat/completions' || req.method !== 'POST') return orErr(404, 'مسار غير مدعوم');
-  if (cfg.provider !== 'openrouter') return orErr(409, 'غيّر مدير التطبيق طريقة الكتابة؛ أعد فتح التطبيق.');
+  if (cfg.provider === 'anthropic') return orErr(409, 'غيّر مدير التطبيق طريقة الكتابة؛ أعد فتح التطبيق.');
   const dev = deviceOf(req);
   const meta = metaOf(req);
   const denied = await admit(env, cfg, ctx, dev, meta, 'openrouter');
@@ -253,6 +290,25 @@ async function proxyOpenRouter(req, env, ctx, path) {
 
   let body;
   try { body = await req.json(); } catch { return orErr(400, 'طلب غير صالح'); }
+  // المزوّد الذي اختاره المدير أولًا، والآخر احتياطًا إن كانت له مفاتيح (الصيغة نفسها)
+  const order = cfg.provider === 'gemini' ? ['gemini', 'openrouter'] : ['openrouter', 'gemini'];
+  for (const prov of order) {
+    const res = prov === 'gemini' ? await viaGemini(env, ctx, cfg, dev, meta, body) : await viaOpenRouter(env, ctx, cfg, dev, meta, { ...body });
+    if (res) return res; // null = لا مفتاح متاح لهذا المزوّد
+  }
+  logEvent(env, ctx, dev, meta, cfg.provider, null, 503, 0);
+  if (cfg.notify.keys) ctx.waitUntil(telegram(env, cfg, '❌ كل مفاتيح الكتابة انتهت حصتها أو تعطلت. أضف مفتاحًا جديدًا من لوحة المدير.'));
+  return orErr(503, 'انتهت حصة خادم التطبيق مؤقتًا. أخبر مدير التطبيق أو حاول لاحقًا.');
+}
+
+/** تمرير الرد كما هو (ومنه البث المتدفق) مع رؤوس CORS. */
+function passThrough(res) {
+  const h = new Headers(CORS);
+  h.set('content-type', res.headers.get('content-type') || 'application/json');
+  return new Response(res.body, { status: res.status, headers: h });
+}
+
+async function viaOpenRouter(env, ctx, cfg, dev, meta, body) {
   const vision = JSON.stringify(body.messages || []).includes('"image_url"');
   // النماذج يختارها المدير وحده
   const chain = vision
@@ -267,11 +323,7 @@ async function proxyOpenRouter(req, env, ctx, path) {
   const tried = new Set();
   for (;;) {
     const key = await pickKey(env, 'openrouter', tried, dev.keyId);
-    if (!key) {
-      logEvent(env, ctx, dev, meta, models[0], null, 503, 0);
-      if (cfg.notify.keys) ctx.waitUntil(telegram(env, cfg, '❌ كل مفاتيح OpenRouter انتهت حصتها أو تعطلت. أضف مفتاحًا جديدًا من لوحة المدير.'));
-      return orErr(503, 'انتهت حصة خادم التطبيق مؤقتًا. أخبر مدير التطبيق أو حاول لاحقًا.');
-    }
+    if (!key) return null;
     tried.add(key.id);
     const t0 = now();
     const res = await fetch(`${base}/chat/completions`, {
@@ -282,15 +334,62 @@ async function proxyOpenRouter(req, env, ctx, path) {
     if (res.ok) {
       ctx.waitUntil(useKey(env, key));
       logEvent(env, ctx, dev, meta, models[0], key.id, res.status, now() - t0);
-      const h = new Headers(CORS);
-      h.set('content-type', res.headers.get('content-type') || 'application/json');
-      return new Response(res.body, { status: res.status, headers: h });
+      return passThrough(res);
     }
     const text = await res.text();
     const verdict = verdictOf('openrouter', res.status, text);
     if (verdict) { await markKey(env, cfg, key, verdict, text, ctx); continue; }
     logEvent(env, ctx, dev, meta, models[0], key.id, res.status, now() - t0);
     return new Response(text, { status: res.status, headers: { ...CORS, 'content-type': 'application/json' } });
+  }
+}
+
+/**
+ * Gemini بصيغة OpenAI. حصته المجانية لكل نموذج على حدة: إذا انتهت حصة نموذج نجرّب التالي بالمفتاح نفسه،
+ * ولا نعلّم المفتاح منتهيًا إلا إذا انتهت كل النماذج.
+ */
+async function viaGemini(env, ctx, cfg, dev, meta, src) {
+  const models = geminiChain(cfg).map((m) => m.id);
+  const base = `${env.GEMINI_UPSTREAM || GEM_BASE}/openai`;
+  const out = { messages: src.messages, stream: !!src.stream, max_tokens: Math.min(Number(src.max_tokens) || 4000, 16000), reasoning_effort: 'low' };
+  if (src.temperature != null) out.temperature = src.temperature;
+  if (src.response_format) out.response_format = { type: 'json_object' };
+  const call = (key, b) => fetch(`${base}/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${key.secret}` }, body: JSON.stringify(b) });
+
+  const tried = new Set();
+  for (;;) {
+    const key = await pickKey(env, 'gemini', tried, dev.keyId);
+    if (!key) return null;
+    tried.add(key.id);
+    let verdict = 'daily';
+    let last = '';
+    for (const model of models) {
+      const t0 = now();
+      let b = { ...out, model };
+      let res = await call(key, b);
+      let text = res.ok ? '' : await res.text();
+      // نموذج لا يدعم وضع JSON أو مستوى التفكير: نعيد الطلب مرة واحدة دونهما
+      if (res.status === 400 && !verdictOf('gemini', 400, text)) {
+        const { response_format: _rf, reasoning_effort: _re, ...plain } = b;
+        b = plain;
+        res = await call(key, b);
+        text = res.ok ? '' : await res.text();
+      }
+      if (res.ok) {
+        ctx.waitUntil(useKey(env, key));
+        logEvent(env, ctx, dev, meta, model, key.id, res.status, now() - t0);
+        return passThrough(res);
+      }
+      const v = verdictOf('gemini', res.status, text);
+      last = text;
+      if (v === 'invalid') { verdict = 'invalid'; break; }
+      if (v) { if (v === 'minute') verdict = 'minute'; continue; } // حصة هذا النموذج: نجرّب التالي
+      logEvent(env, ctx, dev, meta, model, key.id, res.status, now() - t0);
+      const msg = errMsg(text);
+      if (/location is not supported/i.test(msg)) return orErr(400, 'Gemini غير متاح من موقع الخادم. اختر OpenRouter من لوحة المدير.');
+      return json({ error: { code: res.status, message: msg || `Gemini HTTP ${res.status}` } }, res.status);
+    }
+    await markKey(env, cfg, key, verdict, last, ctx);
   }
 }
 
@@ -349,12 +448,14 @@ async function publicConfig(req, env) {
   const used = dev.id
     ? (await q(env, 'SELECT COUNT(DISTINCT report) AS n FROM events WHERE device = ? AND kind = \'report\' AND ts >= ?', dev.id, dayStart()).first())?.n || 0
     : 0;
-  const keys = (await q(env, 'SELECT COUNT(*) AS n FROM keys WHERE provider = ? AND enabled = 1 AND until <= ?', cfg.provider === 'anthropic' ? 'anthropic' : 'openrouter', now()).first())?.n || 0;
+  const provs = cfg.provider === 'anthropic' ? ['anthropic'] : ['openrouter', 'gemini']; // الصيغة نفسها: أحدهما احتياط للآخر
+  const keys = (await q(env, `SELECT COUNT(*) AS n FROM keys WHERE provider IN (${provs.map(() => '?').join(',')}) AND enabled = 1 AND until <= ?`, ...provs, now()).first())?.n || 0;
   return json({
     ok: true,
     appName: cfg.appName,
     provider: cfg.provider,
-    models: cfg.provider === 'anthropic' ? [{ id: cfg.claudeModel, name: cfg.claudeModel }] : cfg.textModels.map((m) => ({ id: m.id, name: m.name })),
+    models: cfg.provider === 'anthropic' ? [{ id: cfg.claudeModel, name: cfg.claudeModel }]
+      : (cfg.provider === 'gemini' ? geminiChain(cfg) : cfg.textModels).map((m) => ({ id: m.id, name: m.name })),
     claudeModel: cfg.claudeModel,
     dailyLimit: cfg.dailyLimit,
     usedToday: used,
@@ -428,7 +529,7 @@ const keyView = (k) => {
 const configView = (cfg) => ({ ...cfg, telegram: { chat: cfg.telegram.chat, token: mask(cfg.telegram.token), hasToken: !!cfg.telegram.token } });
 
 async function addKey(env, body) {
-  const provider = body.provider === 'anthropic' ? 'anthropic' : 'openrouter';
+  const provider = PROVIDERS.includes(body.provider) ? body.provider : 'openrouter';
   const secret = String(body.secret || '').replace(/[\s​-‏‪-‮⁠-⁩﻿]/g, '');
   if (secret.length < 20) return { error: 'المفتاح قصير أو غير صحيح' };
   const label = clip(String(body.label || '').trim(), 40) || `مفتاح ${mask(secret)}`;
@@ -464,7 +565,11 @@ async function admin(req, env, ctx, path) {
     const cfg = await getConfig(env);
     const next = { ...cfg };
     if (typeof body.appName === 'string') next.appName = clip(body.appName.trim(), 40) || 'sadiqabbas';
-    if (['openrouter', 'anthropic'].includes(body.provider)) next.provider = body.provider;
+    if (PROVIDERS.includes(body.provider)) next.provider = body.provider;
+    if (Array.isArray(body.geminiModels)) {
+      next.geminiModels = body.geminiModels.filter((x) => x?.id).slice(0, 3)
+        .map((x) => ({ id: clip(String(x.id).replace(/^models\//, ''), 120), name: clip(x.name || x.id, 80) }));
+    }
     if (Array.isArray(body.textModels)) next.textModels = body.textModels.filter((x) => x?.id).slice(0, 3).map((x) => ({ id: clip(x.id, 120), name: clip(x.name || x.id, 80), vision: !!x.vision, structured: !!x.structured, json: !!x.json, ctx: Number(x.ctx) || 0, maxOut: Number(x.maxOut) || 0 }));
     if (body.visionModel === null || body.visionModel?.id) next.visionModel = body.visionModel ? { id: clip(body.visionModel.id, 120), name: clip(body.visionModel.name || body.visionModel.id, 80), structured: !!body.visionModel.structured, json: !!body.visionModel.json } : null;
     if (CLAUDE_MODELS.includes(body.claudeModel)) next.claudeModel = body.claudeModel;
@@ -480,6 +585,21 @@ async function admin(req, env, ctx, path) {
     if (body.notify) next.notify = { ...cfg.notify, ...Object.fromEntries(Object.entries(body.notify).filter(([, v]) => typeof v === 'boolean')) };
     await saveConfig(env, next);
     return json({ ok: true, config: configView(next) });
+  }
+
+  if (path === '/admin/gemini/models' && m === 'GET') {
+    const key = await q(env, 'SELECT secret FROM keys WHERE provider = \'gemini\' AND enabled = 1 ORDER BY id LIMIT 1').first();
+    if (!key) return json({ error: 'أضف مفتاح Gemini أولًا ثم اختر النماذج.' }, 400);
+    const r = await fetch(`${env.GEMINI_UPSTREAM || GEM_BASE}/models?pageSize=1000`, { headers: { 'x-goog-api-key': key.secret } });
+    const raw = await r.text();
+    if (!r.ok) return json({ error: errMsg(raw) || `HTTP ${r.status}` }, 502);
+    let list = [];
+    try { list = JSON.parse(raw).models || []; } catch { /* فارغة */ }
+    const models = list
+      .filter((x) => (x.supportedGenerationMethods || []).includes('generateContent') && /gemini|gemma/i.test(x.name)
+        && !/embed|tts|image|live|audio|aqa|robotics|computer-use|native/i.test(x.name))
+      .map((x) => ({ id: String(x.name).replace(/^models\//, ''), name: x.displayName || x.name, ctx: x.inputTokenLimit || 0, out: x.outputTokenLimit || 0 }));
+    return json({ models });
   }
 
   if (path === '/admin/telegram/test' && m === 'POST') {
@@ -498,12 +618,16 @@ async function admin(req, env, ctx, path) {
     if (seg[3] === 'test' && m === 'POST') {
       const r = key.provider === 'anthropic'
         ? await fetch(`${env.ANTHROPIC_UPSTREAM || AN_BASE}/v1/models`, { headers: { 'x-api-key': key.secret, 'anthropic-version': '2023-06-01' } })
-        : await fetch(`${env.OR_UPSTREAM || OR_BASE}/key`, { headers: { authorization: `Bearer ${key.secret}` } });
-      const info = await r.json().catch(() => ({}));
+        : key.provider === 'gemini'
+          ? await fetch(`${env.GEMINI_UPSTREAM || GEM_BASE}/models?pageSize=1`, { headers: { 'x-goog-api-key': key.secret } })
+          : await fetch(`${env.OR_UPSTREAM || OR_BASE}/key`, { headers: { authorization: `Bearer ${key.secret}` } });
+      const raw = await r.text();
+      let info = {};
+      try { info = JSON.parse(raw); if (Array.isArray(info)) info = info[0] || {}; } catch { /* نص */ }
       if (r.ok) await q(env, 'UPDATE keys SET status = \'ok\', until = 0, note = \'\' WHERE id = ?', id).run();
-      else if (r.status === 401) await q(env, 'UPDATE keys SET status = \'invalid\', until = ?, note = ? WHERE id = ?', 9e15, 'مرفوض في الاختبار', id).run();
+      else if (verdictOf(key.provider, r.status, raw) === 'invalid') await q(env, 'UPDATE keys SET status = \'invalid\', until = ?, note = ? WHERE id = ?', 9e15, 'مرفوض في الاختبار', id).run();
       const d = info.data || {};
-      return json({ ok: r.ok, status: r.status, info: r.ok ? (key.provider === 'anthropic' ? 'المفتاح يعمل' : `يعمل${d.is_free_tier ? ' — حساب مجاني (50 طلبًا يوميًا للنماذج المجانية)' : ''}${d.limit_remaining != null ? ` — المتبقي ${d.limit_remaining}` : ''}`) : (info.error?.message || `HTTP ${r.status}`) });
+      return json({ ok: r.ok, status: r.status, info: r.ok ? (key.provider !== 'openrouter' ? 'المفتاح يعمل' : `يعمل${d.is_free_tier ? ' — حساب مجاني (50 طلبًا يوميًا للنماذج المجانية)' : ''}${d.limit_remaining != null ? ` — المتبقي ${d.limit_remaining}` : ''}`) : (info.error?.message || `HTTP ${r.status}`) });
     }
     if (m === 'PATCH') {
       if (typeof body.enabled === 'boolean') await q(env, 'UPDATE keys SET enabled = ? WHERE id = ?', body.enabled ? 1 : 0, id).run();
